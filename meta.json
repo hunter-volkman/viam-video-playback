@@ -1,0 +1,13 @@
+{
+  "module_id": "video-stream",
+  "visibility": "private",
+  "url": "https://github.com/YOUR_USERNAME/viam-video-stream",
+  "description": "High-performance video streaming module for Viam",
+  "models": [
+    {
+      "api": "rdk:component:camera",
+      "model": "viam:video-stream:replay"
+    }
+  ],
+  "entrypoint": "./bin/video-stream-module"
+}
