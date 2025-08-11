@@ -19,9 +19,6 @@ This model implements the rdk:component:camera API by decoding and streaming a v
 | Name | Type | Description |
 |------|------|-----------|
 | `video_path` | string | The absolute file path to the video file to be streamed |
-| `target_version` | string | Expected NetworkManager version after backport |
-| `work_dir` | string | Working directory for installation |
-| `platform` | string | Platform identifier (e.g., "ubuntu-22.04") |
 
 #### Optional Attributes
 
