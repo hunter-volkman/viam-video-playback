@@ -67,7 +67,6 @@ endif()
 add_executable(video-stream-module
     src/main.cpp
     src/video_stream_camera.cpp
-    src/buffer/frame_pool.cpp
 )
 
 target_include_directories(video-stream-module PRIVATE
