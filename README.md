@@ -1,8 +1,8 @@
 # Video Stream Module
-A Viam module which uses a Producer-Consumer architecture to achieve high frame rates. A single producer thread handles hardware-accelerated video decoding and places frames into a queue. A pool of consumer threads takes frames from the queue and performs JPEG encoding in parallel, preventing the decoding pipeline from stalling.
+A Viam module for replaying a local video file as a high-performance live stream (for tests).
 
 ## Model viam:video-stream:replay
-This model implements the rdk:component:camera API by decoding and streaming a video file.
+This model implements the `rdk:component:camera` API by decoding and streaming a video file.
 
 ### Configuration
 
