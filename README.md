@@ -1,5 +1,5 @@
 # Video Stream Module
-A Viam module for replaying a local video file as a high-performance live stream (for testing).
+A Viam module for replaying a local video file as a "high-performance live stream" (for testing).
 
 ## Model viam:video-stream:replay
 This model implements the `rdk:component:camera` API by decoding and streaming a video file.
