@@ -1,9 +1,10 @@
 #include "video_stream_camera.hpp"
-#include "buffer/frame_pool.hpp"
+
 #include <viam/sdk/common/exception.hpp>
 #include <viam/sdk/common/proto_value.hpp>
 #include <iostream>
 #include <vector>
+#include <string>
 
 namespace viam {
 namespace video_stream {
@@ -12,470 +13,392 @@ sdk::Model VideoStreamCamera::model() {
     return sdk::Model{"viam", "video-stream", "replay"};
 }
 
+std::shared_ptr<sdk::Resource> VideoStreamCamera::create(const sdk::Dependencies& deps,
+                                                         const sdk::ResourceConfig& cfg) {
+    return std::make_shared<VideoStreamCamera>(deps, cfg);
+}
+
 VideoStreamCamera::VideoStreamCamera(const sdk::Dependencies& deps, const sdk::ResourceConfig& cfg)
-    : Camera(cfg.name()), frame_pool_(std::make_unique<FramePool>(10)) {
+    : Camera(cfg.name()) {
+    // Determine a sensible number of encoder threads based on available hardware.
+    // We use half the cores, with a minimum of 2, to leave resources for decoding and other system tasks.
+    num_encoder_threads_ = std::max(2, static_cast<int>(std::thread::hardware_concurrency() / 2));
     std::cout << "Initializing VideoStreamCamera: " << cfg.name() << std::endl;
     reconfigure(deps, cfg);
 }
 
 VideoStreamCamera::~VideoStreamCamera() {
-    stop_streaming();
-    
-    // Clean up MJPEG encoder
-    if (yuvj_frame_) av_frame_free(&yuvj_frame_);
-    if (sws_to_yuvj_ctx_) sws_freeContext(sws_to_yuvj_ctx_);
-    if (mjpeg_enc_ctx_) avcodec_free_context(&mjpeg_enc_ctx_);
-    
-#ifdef USE_VIDEOTOOLBOX
-    if (hw_device_ctx_) av_buffer_unref(&hw_device_ctx_);
-#endif
-    
-    // Clean up decoder
-    if (codec_ctx_) avcodec_free_context(&codec_ctx_);
-    if (format_ctx_) avformat_close_input(&format_ctx_);
+    stop_pipeline();
 }
 
 void VideoStreamCamera::reconfigure(const sdk::Dependencies& deps, const sdk::ResourceConfig& cfg) {
-    stop_streaming();
+    stop_pipeline();
     
     auto attrs = cfg.attributes();
     
-    // Get video path from config
-    auto video_path_attr = attrs.find("video_path");
-    if (video_path_attr != attrs.end()) {
-        auto* str_val = video_path_attr->second.get<std::string>();
-        if (str_val) {
-            video_path_ = *str_val;
-        }
-    } else {
-        throw sdk::Exception("video_path attribute is required");
+    if (attrs.find("video_path") == attrs.end()) {
+        throw sdk::Exception("`video_path` attribute is required.");
+    }
+    video_path_ = *attrs.at("video_path").get<std::string>();
+    
+    if (attrs.find("loop") != attrs.end()) {
+        loop_playback_ = *attrs.at("loop").get<bool>();
+    }
+    if (attrs.find("target_fps") != attrs.end()) {
+        target_fps_ = static_cast<int>(*attrs.at("target_fps").get<double>());
+    }
+    // Add a quality setting for performance tuning. Higher is faster but lower quality.
+    if (attrs.find("jpeg_quality_level") != attrs.end()) {
+        quality_level_ = static_cast<int>(*attrs.at("jpeg_quality_level").get<double>());
     }
     
-    // Optional attributes
-    auto loop_attr = attrs.find("loop");
-    if (loop_attr != attrs.end()) {
-        auto* bool_val = loop_attr->second.get<bool>();
-        if (bool_val) {
-            loop_playback_ = *bool_val;
-        }
+    std::cout << "Reconfiguring video stream:" << std::endl;
+    std::cout << "  - Path: " << video_path_ << std::endl;
+    std::cout << "  - Loop: " << (loop_playback_ ? "yes" : "no") << std::endl;
+    std::cout << "  - Target FPS: " << (target_fps_ > 0 ? std::to_string(target_fps_) : "source") << std::endl;
+    std::cout << "  - JPEG Quality Level: " << quality_level_ << std::endl;
+
+    if (!initialize_decoder(video_path_)) {
+        throw sdk::Exception("Failed to initialize video decoder for: " + video_path_);
     }
     
-    auto fps_attr = attrs.find("target_fps");
-    if (fps_attr != attrs.end()) {
-        auto* double_val = fps_attr->second.get<double>();
-        if (double_val) {
-            target_fps_ = static_cast<int>(*double_val);
-        }
+    if (!initialize_encoder_pool(decoder_ctx_->width, decoder_ctx_->height)) {
+        throw sdk::Exception("Failed to initialize JPEG encoder pool.");
     }
     
-    std::cout << "Opening video file: " << video_path_ << std::endl;
-    std::cout << "Loop playback: " << loop_playback_ << std::endl;
-    std::cout << "Target FPS: " << target_fps_ << std::endl;
-    
-    if (!open_video_file(video_path_)) {
-        throw sdk::Exception("Failed to open video file: " + video_path_);
-    }
-    
-    start_streaming();
+    start_pipeline();
 }
 
-bool VideoStreamCamera::open_video_file(const std::string& path) {
-    // Open video file
-    if (avformat_open_input(&format_ctx_, path.c_str(), nullptr, nullptr) < 0) {
-        std::cerr << "Failed to open video file: " << path << std::endl;
-        return false;
-    }
-    
-    if (avformat_find_stream_info(format_ctx_, nullptr) < 0) {
-        std::cerr << "Failed to find stream info" << std::endl;
-        return false;
-    }
-    
-    // Find video stream
-    for (unsigned int i = 0; i < format_ctx_->nb_streams; i++) {
-        if (format_ctx_->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            video_stream_index_ = i;
-            break;
-        }
-    }
-    
-    if (video_stream_index_ == -1) {
-        std::cerr << "No video stream found" << std::endl;
-        return false;
-    }
-    
+bool VideoStreamCamera::initialize_decoder(const std::string& path) {
+    if (avformat_open_input(&format_ctx_, path.c_str(), nullptr, nullptr) < 0) return false;
+    if (avformat_find_stream_info(format_ctx_, nullptr) < 0) return false;
+
+    video_stream_index_ = av_find_best_stream(format_ctx_, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder_, 0);
+    if (video_stream_index_ < 0) return false;
+
     AVStream* video_stream = format_ctx_->streams[video_stream_index_];
     source_fps_ = av_q2d(video_stream->r_frame_rate);
     
-    // Setup decoder
-    codec_ = avcodec_find_decoder(video_stream->codecpar->codec_id);
-    if (!codec_) {
-        std::cerr << "Codec not found" << std::endl;
-        return false;
-    }
-    
-    codec_ctx_ = avcodec_alloc_context3(codec_);
-    avcodec_parameters_to_context(codec_ctx_, video_stream->codecpar);
+    decoder_ctx_ = avcodec_alloc_context3(decoder_);
+    avcodec_parameters_to_context(decoder_ctx_, video_stream->codecpar);
     
 #ifdef USE_VIDEOTOOLBOX
-    // Enable VideoToolbox hardware acceleration
-    codec_ctx_->get_format = &VideoStreamCamera::get_hw_format;
-    init_hw_device(); // ignore failure; we can fall back to software
+    initialize_hw_decoder_internal();
 #endif
     
-    // Enable multi-threading for blazing performance
-    codec_ctx_->thread_count = std::max(1u, std::thread::hardware_concurrency());
-    codec_ctx_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+    decoder_ctx_->thread_count = std::max(1u, std::thread::hardware_concurrency());
+    decoder_ctx_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+    decoder_ctx_->flags |= AV_CODEC_FLAG_LOW_DELAY;
     
-    if (avcodec_open2(codec_ctx_, codec_, nullptr) < 0) {
-        std::cerr << "Failed to open codec" << std::endl;
-        return false;
-    }
+    if (avcodec_open2(decoder_ctx_, decoder_, nullptr) < 0) return false;
     
-    // Initialize MJPEG encoder for real JPEG output
-    if (!init_mjpeg_encoder(codec_ctx_->width, codec_ctx_->height)) {
-        std::cerr << "Failed to init MJPEG encoder" << std::endl;
-        return false;
-    }
-    
-    // Calculate frame duration
     double fps = (target_fps_ > 0) ? target_fps_ : source_fps_;
     frame_duration_ = std::chrono::microseconds(static_cast<int64_t>(1000000.0 / fps));
-    
-    std::cout << "Video opened: " << codec_ctx_->width << "x" << codec_ctx_->height 
-              << " @ " << fps << " FPS" << std::endl;
-    std::cout << "Hardware acceleration: " << (codec_ctx_->hw_device_ctx ? "VideoToolbox" : "Software") << std::endl;
-    
+
+    std::cout << "Decoder initialized successfully:" << std::endl;
+    std::cout << "  - Resolution: " << decoder_ctx_->width << "x" << decoder_ctx_->height << std::endl;
+    std::cout << "  - Pacing at " << fps << " FPS" << std::endl;
+    std::cout << "  - HW Accel: " << (decoder_ctx_->hw_device_ctx ? "Enabled" : "Software") << std::endl;
+
     return true;
 }
 
-bool VideoStreamCamera::init_mjpeg_encoder(int w, int h) {
-    mjpeg_enc_ = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
-    if (!mjpeg_enc_) {
-        std::cerr << "MJPEG encoder not found" << std::endl;
-        return false;
-    }
+bool VideoStreamCamera::initialize_encoder_pool(int width, int height) {
+    std::cout << "Initializing encoder pool with " << num_encoder_threads_ << " threads." << std::endl;
+    const AVCodec* mjpeg_encoder = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
+    if (!mjpeg_encoder) return false;
 
-    mjpeg_enc_ctx_ = avcodec_alloc_context3(mjpeg_enc_);
-    mjpeg_enc_ctx_->codec_type = AVMEDIA_TYPE_VIDEO;
-    mjpeg_enc_ctx_->codec_id = AV_CODEC_ID_MJPEG;
-    mjpeg_enc_ctx_->pix_fmt = AV_PIX_FMT_YUVJ420P; // JPEG standard colorspace
-    mjpeg_enc_ctx_->width = w;
-    mjpeg_enc_ctx_->height = h;
-    mjpeg_enc_ctx_->time_base = AVRational{1, (target_fps_ > 0) ? target_fps_ : static_cast<int>(source_fps_)};
-    
-    // High quality JPEG (lower qscale = higher quality)
-    av_opt_set_int(mjpeg_enc_ctx_, "qscale", 3, 0);
+    mjpeg_encoder_ctxs_.resize(num_encoder_threads_);
+    sws_contexts_.resize(num_encoder_threads_, nullptr);
+    yuv_frames_.resize(num_encoder_threads_);
 
-    if (avcodec_open2(mjpeg_enc_ctx_, mjpeg_enc_, nullptr) < 0) {
-        std::cerr << "Failed to open MJPEG encoder" << std::endl;
-        return false;
-    }
-
-    // Allocate reusable YUVJ frame
-    yuvj_frame_ = av_frame_alloc();
-    yuvj_frame_->format = mjpeg_enc_ctx_->pix_fmt;
-    yuvj_frame_->width = w;
-    yuvj_frame_->height = h;
-    if (av_frame_get_buffer(yuvj_frame_, 32) < 0) {
-        std::cerr << "Failed to allocate YUVJ frame buffer" << std::endl;
-        return false;
-    }
-
-    std::cout << "MJPEG encoder initialized: " << w << "x" << h << std::endl;
-    return true;
-}
-
-bool VideoStreamCamera::ensure_yuvj_frame_from_current(AVFrame* src, AVFrame** out) {
-    if (!yuvj_frame_ || !src) return false;
-
-    if (!sws_to_yuvj_ctx_) {
-        sws_to_yuvj_ctx_ = sws_getContext(
-            src->width, src->height, static_cast<AVPixelFormat>(src->format),
-            yuvj_frame_->width, yuvj_frame_->height, AV_PIX_FMT_YUVJ420P,
-            SWS_FAST_BILINEAR, nullptr, nullptr, nullptr
-        );
-        if (!sws_to_yuvj_ctx_) {
-            std::cerr << "Failed to create swscale context for YUVJ conversion" << std::endl;
+    for (int i = 0; i < num_encoder_threads_; ++i) {
+        mjpeg_encoder_ctxs_[i] = avcodec_alloc_context3(mjpeg_encoder);
+        AVCodecContext* ctx = mjpeg_encoder_ctxs_[i];
+        ctx->pix_fmt = AV_PIX_FMT_YUVJ420P;
+        ctx->width = width;
+        ctx->height = height;
+        ctx->time_base = AVRational{1, (target_fps_ > 0) ? target_fps_ : static_cast<int>(source_fps_)};
+        
+        AVDictionary* opts = nullptr;
+        // Set low delay and unofficial compliance via dictionary options, which is more reliable.
+        av_dict_set(&opts, "strict", "-2", 0); // Corresponds to FF_COMPLIANCE_UNOFFICIAL
+        
+        if (avcodec_open2(ctx, mjpeg_encoder, &opts) < 0) {
+            av_dict_free(&opts);
             return false;
         }
-    }
+        av_dict_free(&opts);
 
-    // Convert to YUVJ420P (JPEG colorspace)
-    if (sws_scale(
-        sws_to_yuvj_ctx_,
-        src->data, src->linesize,
-        0, src->height,
-        yuvj_frame_->data, yuvj_frame_->linesize) <= 0) {
-        return false;
+        av_opt_set(ctx->priv_data, "q", std::to_string(quality_level_).c_str(), 0);
+
+        yuv_frames_[i] = av_frame_alloc();
+        yuv_frames_[i]->format = AV_PIX_FMT_YUVJ420P;
+        yuv_frames_[i]->width = width;
+        yuv_frames_[i]->height = height;
+        if (av_frame_get_buffer(yuv_frames_[i], 32) < 0) return false;
     }
-    
-    *out = yuvj_frame_;
     return true;
 }
 
-bool VideoStreamCamera::encode_frame_to_jpeg(AVFrame* src, std::vector<uint8_t>& out_jpeg) {
-    // Convert to YUVJ420P if necessary
-    AVFrame* yuvj_out = nullptr;
-    if (!ensure_yuvj_frame_from_current(src, &yuvj_out)) {
-        return false;
+void VideoStreamCamera::cleanup_encoder_pool() {
+    for (auto& ctx : mjpeg_encoder_ctxs_) if (ctx) avcodec_free_context(&ctx);
+    for (auto& frame : yuv_frames_) if (frame) av_frame_free(&frame);
+    for (auto& sws_ctx : sws_contexts_) if (sws_ctx) sws_freeContext(sws_ctx);
+    mjpeg_encoder_ctxs_.clear();
+    yuv_frames_.clear();
+    sws_contexts_.clear();
+}
+
+void VideoStreamCamera::start_pipeline() {
+    if (is_running_) return;
+    is_running_ = true;
+    start_time_ = std::chrono::high_resolution_clock::now();
+    
+    producer_thread_ = std::thread(&VideoStreamCamera::producer_thread_func, this);
+    for (int i = 0; i < num_encoder_threads_; ++i) {
+        encoder_threads_.emplace_back(&VideoStreamCamera::consumer_thread_func, this, i);
+    }
+}
+
+void VideoStreamCamera::stop_pipeline() {
+    if (!is_running_) return;
+    is_running_ = false;
+    
+    queue_consumer_cv_.notify_all();
+    queue_producer_cv_.notify_all();
+    jpeg_ready_cv_.notify_all();
+    
+    if (producer_thread_.joinable()) producer_thread_.join();
+    for (auto& t : encoder_threads_) if (t.joinable()) t.join();
+    encoder_threads_.clear();
+    
+    cleanup_encoder_pool();
+    if (decoder_ctx_) {
+        avcodec_free_context(&decoder_ctx_);
+        decoder_ctx_ = nullptr;
+    }
+    if (format_ctx_) {
+        avformat_close_input(&format_ctx_);
+        format_ctx_ = nullptr;
     }
 
-    // Encode to MJPEG
+    // Clear the queue of any remaining frames
+    while(!frame_queue_.empty()) {
+        av_frame_free(&frame_queue_.front().frame);
+        frame_queue_.pop();
+    }
+}
+
+void VideoStreamCamera::producer_thread_func() {
+    AVPacket* packet = av_packet_alloc();
+    AVFrame* frame = av_frame_alloc();
+    AVFrame* sw_frame = av_frame_alloc();
+    auto next_frame_time = std::chrono::high_resolution_clock::now();
+
+    while (is_running_) {
+        if (av_read_frame(format_ctx_, packet) < 0) {
+            if (loop_playback_) {
+                av_seek_frame(format_ctx_, video_stream_index_, 0, AVSEEK_FLAG_BACKWARD);
+                next_frame_time = std::chrono::high_resolution_clock::now();
+                continue;
+            } else {
+                break;
+            }
+        }
+
+        if (packet->stream_index == video_stream_index_) {
+            int ret = avcodec_send_packet(decoder_ctx_, packet);
+            if (ret >= 0) {
+                while (ret >= 0) {
+                    ret = avcodec_receive_frame(decoder_ctx_, frame);
+                    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+                    if (ret < 0) break;
+                    if (!is_running_) break;
+
+                    std::this_thread::sleep_until(next_frame_time);
+                    next_frame_time += frame_duration_;
+                    frames_decoded_++;
+
+                    AVFrame* frame_to_queue = av_frame_alloc();
+#ifdef USE_VIDEOTOOLBOX
+                    if (frame->format == AV_PIX_FMT_VIDEOTOOLBOX) {
+                        if (transfer_hw_frame_to_sw(frame, sw_frame)) {
+                            av_frame_move_ref(frame_to_queue, sw_frame);
+                        } else {
+                            frames_dropped_producer_++;
+                            av_frame_free(&frame_to_queue);
+                            av_frame_unref(frame);
+                            continue;
+                        }
+                    } else {
+                       av_frame_move_ref(frame_to_queue, frame);
+                    }
+#else
+                    av_frame_move_ref(frame_to_queue, frame);
+#endif
+
+                    {
+                        std::unique_lock<std::mutex> lock(queue_mutex_);
+                        if (frame_queue_.size() >= max_queue_size_) {
+                            // Drop frame if queue is full to prevent memory bloat
+                            frames_dropped_producer_++;
+                            av_frame_free(&frame_to_queue);
+                        } else {
+                            frame_queue_.push({frame_to_queue});
+                            lock.unlock();
+                            queue_consumer_cv_.notify_one();
+                        }
+                    }
+                    av_frame_unref(frame);
+                }
+            }
+        }
+        av_packet_unref(packet);
+    }
+    
+    is_running_ = false; // Signal consumers to shut down
+    queue_consumer_cv_.notify_all();
+    av_packet_free(&packet);
+    av_frame_free(&frame);
+    av_frame_free(&sw_frame);
+    std::cout << "Producer thread finished." << std::endl;
+}
+
+void VideoStreamCamera::consumer_thread_func(int thread_id) {
+    std::vector<uint8_t> local_jpeg_buffer;
+    if (decoder_ctx_) {
+        local_jpeg_buffer.reserve(decoder_ctx_->width * decoder_ctx_->height); // Pre-reserve
+    }
+
+    while (is_running_) {
+        std::unique_lock<std::mutex> lock(queue_mutex_);
+        queue_consumer_cv_.wait(lock, [this] { return !frame_queue_.empty() || !is_running_; });
+
+        if (!is_running_ && frame_queue_.empty()) break;
+        
+        EncodingTask task = std::move(frame_queue_.front());
+        frame_queue_.pop();
+        lock.unlock();
+
+        if (encode_task(thread_id, task, local_jpeg_buffer)) {
+            frames_encoded_++;
+            {
+                std::lock_guard<std::mutex> jpeg_lock(jpeg_mutex_);
+                latest_jpeg_buffer_ = local_jpeg_buffer;
+                is_jpeg_ready_ = true;
+            }
+            jpeg_ready_cv_.notify_one();
+        } else {
+            frames_dropped_consumer_++;
+        }
+        av_frame_free(&task.frame);
+    }
+    std::cout << "Consumer thread " << thread_id << " finished." << std::endl;
+}
+
+bool VideoStreamCamera::encode_task(int thread_id, EncodingTask& task, std::vector<uint8_t>& jpeg_buffer) {
+    AVFrame* yuv_frame = yuv_frames_[thread_id];
+    
+    // Lazy initialization of SWS context per thread
+    if (!sws_contexts_[thread_id]) {
+        sws_contexts_[thread_id] = sws_getContext(
+            task.frame->width, task.frame->height, (AVPixelFormat)task.frame->format,
+            yuv_frame->width, yuv_frame->height, AV_PIX_FMT_YUVJ420P,
+            SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+    }
+    if (!sws_contexts_[thread_id]) return false;
+
+    sws_scale(sws_contexts_[thread_id], task.frame->data, task.frame->linesize, 0,
+              task.frame->height, yuv_frame->data, yuv_frame->linesize);
+
     AVPacket* pkt = av_packet_alloc();
-    int ret = avcodec_send_frame(mjpeg_enc_ctx_, yuvj_out);
-    if (ret < 0) {
-        av_packet_free(&pkt);
-        return false;
+    int ret = avcodec_send_frame(mjpeg_encoder_ctxs_[thread_id], yuv_frame);
+    if (ret >= 0) {
+        ret = avcodec_receive_packet(mjpeg_encoder_ctxs_[thread_id], pkt);
+        if (ret >= 0) {
+            jpeg_buffer.assign(pkt->data, pkt->data + pkt->size);
+            av_packet_free(&pkt);
+            return true;
+        }
     }
-    
-    ret = avcodec_receive_packet(mjpeg_enc_ctx_, pkt);
-    if (ret < 0) {
-        av_packet_free(&pkt);
-        return false;
-    }
-
-    // Copy JPEG data
-    out_jpeg.resize(pkt->size);
-    std::memcpy(out_jpeg.data(), pkt->data, pkt->size);
-    
     av_packet_free(&pkt);
-    frames_encoded_++;
-    return true;
+    return false;
 }
 
 #ifdef USE_VIDEOTOOLBOX
 enum AVPixelFormat VideoStreamCamera::get_hw_format(AVCodecContext* ctx, const enum AVPixelFormat* pix_fmts) {
     for (const enum AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
-        if (*p == AV_PIX_FMT_VIDEOTOOLBOX) {
-            std::cout << "Using VideoToolbox hardware acceleration" << std::endl;
-            return *p;
-        }
+        if (*p == AV_PIX_FMT_VIDEOTOOLBOX) return *p;
     }
-    std::cout << "VideoToolbox not available, using software decoding" << std::endl;
-    return pix_fmts[0];
+    return AV_PIX_FMT_NONE;
 }
 
-bool VideoStreamCamera::init_hw_device() {
-    if (av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, nullptr, nullptr, 0) < 0) {
-        std::cerr << "VideoToolbox hwdevice init failed; falling back to software" << std::endl;
-        return false;
-    }
-    codec_ctx_->hw_device_ctx = av_buffer_ref(hw_device_ctx_);
-    std::cout << "VideoToolbox hardware device initialized" << std::endl;
+bool VideoStreamCamera::initialize_hw_decoder_internal() {
+    if (av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, nullptr, nullptr, 0) < 0) return false;
+    decoder_ctx_->hw_device_ctx = av_buffer_ref(hw_device_ctx_);
+    decoder_ctx_->get_format = &VideoStreamCamera::get_hw_format;
     return true;
 }
 
-bool VideoStreamCamera::transfer_hwframe_if_needed(AVFrame* src, AVFrame* dst) {
-    if (src->format == AV_PIX_FMT_VIDEOTOOLBOX) {
-        if (av_hwframe_transfer_data(dst, src, 0) < 0) {
-            return false;
-        }
-        dst->width = src->width;
-        dst->height = src->height;
-        return true;
-    }
-    return false;
+bool VideoStreamCamera::transfer_hw_frame_to_sw(AVFrame* src, AVFrame* dst) {
+    return av_hwframe_transfer_data(dst, src, 0) >= 0;
 }
 #endif
-
-void VideoStreamCamera::start_streaming() {
-    running_ = true;
-    start_time_ = std::chrono::high_resolution_clock::now();
-    last_frame_time_ = start_time_;
-    decode_thread_ = std::thread(&VideoStreamCamera::decode_thread, this);
-}
-
-void VideoStreamCamera::stop_streaming() {
-    running_ = false;
-    frame_cv_.notify_all();
-    if (decode_thread_.joinable()) {
-        decode_thread_.join();
-    }
-}
-
-void VideoStreamCamera::decode_thread() {
-    AVPacket* packet = av_packet_alloc();
-    AVFrame* frame = av_frame_alloc();
-    AVFrame* sw_frame = av_frame_alloc(); // for hw->sw transfer
-    
-    std::cout << "Decode thread started" << std::endl;
-    
-    // Reset timing for clean start
-    auto thread_start = std::chrono::high_resolution_clock::now();
-    last_frame_time_ = thread_start;
-    
-    while (running_) {
-        // Read packet
-        if (av_read_frame(format_ctx_, packet) < 0) {
-            if (loop_playback_) {
-                std::cout << "Looping video..." << std::endl;
-                av_seek_frame(format_ctx_, video_stream_index_, 0, AVSEEK_FLAG_BACKWARD);
-                continue;
-            } else {
-                std::cout << "End of video reached" << std::endl;
-                break;
-            }
-        }
-        
-        if (packet->stream_index != video_stream_index_) {
-            av_packet_unref(packet);
-            continue;
-        }
-        
-        // Decode packet
-        int ret = avcodec_send_packet(codec_ctx_, packet);
-        av_packet_unref(packet);
-        if (ret < 0) continue;
-        
-        while (ret >= 0) {
-            ret = avcodec_receive_frame(codec_ctx_, frame);
-            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-                break;
-            }
-            if (ret < 0) break;
-
-#ifdef USE_VIDEOTOOLBOX
-            // Handle hardware frames
-            AVFrame* src_for_encode = frame;
-            av_frame_unref(sw_frame);
-            if (frame->format == AV_PIX_FMT_VIDEOTOOLBOX) {
-                if (!transfer_hwframe_if_needed(frame, sw_frame)) {
-                    continue;
-                }
-                src_for_encode = sw_frame;
-            }
-#else
-            AVFrame* src_for_encode = frame;
-#endif
-
-            // SIMPLIFIED FRAME TIMING - No more aggressive dropping!
-            auto now = std::chrono::high_resolution_clock::now();
-            auto time_since_last = now - last_frame_time_;
-            
-            // Only sleep if we're ahead of schedule
-            if (time_since_last < frame_duration_) {
-                auto sleep_time = frame_duration_ - time_since_last;
-                std::this_thread::sleep_for(sleep_time);
-            }
-            
-            // Encode frame to JPEG immediately for blazing fast get_image()
-            std::vector<uint8_t> jpeg_data;
-            if (encode_frame_to_jpeg(src_for_encode, jpeg_data)) {
-                {
-                    std::lock_guard<std::mutex> jpeg_lock(jpeg_mutex_);
-                    current_jpeg_ = std::move(jpeg_data);
-                    jpeg_ready_ = true;
-                }
-                
-                // Also store raw frame for potential other uses
-                {
-                    std::lock_guard<std::mutex> frame_lock(frame_mutex_);
-                    if (current_frame_) {
-                        av_frame_free(&current_frame_);
-                    }
-                    current_frame_ = av_frame_clone(src_for_encode);
-                    frames_decoded_++;
-                    last_frame_time_ = std::chrono::high_resolution_clock::now();
-                }
-                
-                frame_cv_.notify_one();
-            } else {
-                // Only count as dropped if encoding actually failed
-                frames_dropped_++;
-                std::cerr << "Failed to encode frame to JPEG" << std::endl;
-            }
-        }
-    }
-    
-    av_packet_free(&packet);
-    av_frame_free(&frame);
-    av_frame_free(&sw_frame);
-    std::cout << "Decode thread ended" << std::endl;
-}
 
 sdk::Camera::raw_image VideoStreamCamera::get_image(std::string mime_type, const sdk::ProtoStruct& extra) {
-    // Blazing fast: return pre-encoded JPEG immediately!
     std::unique_lock<std::mutex> lock(jpeg_mutex_);
-    if (!jpeg_ready_ || current_jpeg_.empty()) {
-        lock.unlock();
-        // Wait for first frame if needed
-        std::unique_lock<std::mutex> frame_lock(frame_mutex_);
-        if (!frame_cv_.wait_for(frame_lock, std::chrono::milliseconds(100), 
-                               [this] { return current_frame_ != nullptr; })) {
-            throw sdk::Exception("No frame available");
-        }
-        frame_lock.unlock();
-        lock.lock();
+    if (!jpeg_ready_cv_.wait_for(lock, std::chrono::milliseconds(200), [this] { return is_jpeg_ready_; })) {
+        throw sdk::Exception("Timeout waiting for frame from stream.");
     }
-    
-    if (!jpeg_ready_ || current_jpeg_.empty()) {
-        throw sdk::Exception("No JPEG frame available");
-    }
-    
     sdk::Camera::raw_image img;
-    img.bytes = current_jpeg_; // Copy the pre-encoded JPEG
-    img.mime_type = "image/jpeg"; // TRUE JPEG format!
-    
+    img.bytes = latest_jpeg_buffer_;
+    img.mime_type = "image/jpeg";
     return img;
 }
 
 sdk::Camera::image_collection VideoStreamCamera::get_images() {
-    // Not implemented for single stream
-    return {};
+    throw sdk::Exception("get_images is not implemented for this camera.");
 }
 
 sdk::Camera::point_cloud VideoStreamCamera::get_point_cloud(std::string mime_type, const sdk::ProtoStruct& extra) {
-    throw sdk::Exception("Point cloud not supported for video stream");
+    throw sdk::Exception("get_point_cloud is not implemented for this camera.");
 }
 
 sdk::Camera::properties VideoStreamCamera::get_properties() {
     sdk::Camera::properties props;
     props.supports_pcd = false;
     props.frame_rate = (target_fps_ > 0) ? target_fps_ : std::max(1.0, source_fps_);
-    
-    if (codec_ctx_) {
-        props.intrinsic_parameters.width_px = codec_ctx_->width;
-        props.intrinsic_parameters.height_px = codec_ctx_->height;
+    if (decoder_ctx_) {
+        props.intrinsic_parameters.width_px = decoder_ctx_->width;
+        props.intrinsic_parameters.height_px = decoder_ctx_->height;
     }
-    
     return props;
 }
 
 sdk::ProtoStruct VideoStreamCamera::do_command(const sdk::ProtoStruct& command) {
-    sdk::ProtoStruct result;
-    
-    auto cmd = command.find("command");
-    if (cmd != command.end()) {
-        auto* str_val = cmd->second.get<std::string>();
-        if (str_val && *str_val == "get_stats") {
-            result["frames_decoded"] = sdk::ProtoValue(static_cast<int>(frames_decoded_.load()));
-            result["frames_dropped"] = sdk::ProtoValue(static_cast<int>(frames_dropped_.load()));
-            result["frames_encoded"] = sdk::ProtoValue(static_cast<int>(frames_encoded_.load()));
-            result["hardware_accel"] = sdk::ProtoValue(codec_ctx_ && codec_ctx_->hw_device_ctx ? true : false);
-            
-            // Calculate actual FPS
-            auto now = std::chrono::high_resolution_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time_).count();
-            if (elapsed > 0) {
-                double actual_fps = static_cast<double>(frames_decoded_.load()) / elapsed;
-                result["actual_fps"] = sdk::ProtoValue(actual_fps);
-            }
-        }
+    if (command.find("command") == command.end() || *command.at("command").get<std::string>() != "get_stats") {
+        throw sdk::Exception("Unknown command. Only 'get_stats' is supported.");
     }
+    sdk::ProtoStruct results;
+    // Corrected the ambiguous cast from long long to a specific type (int) for ProtoValue constructor.
+    results["frames_decoded"] = sdk::ProtoValue(static_cast<int>(frames_decoded_.load()));
+    results["frames_encoded"] = sdk::ProtoValue(static_cast<int>(frames_encoded_.load()));
+    results["frames_dropped_producer"] = sdk::ProtoValue(static_cast<int>(frames_dropped_producer_.load()));
+    results["frames_dropped_consumer"] = sdk::ProtoValue(static_cast<int>(frames_dropped_consumer_.load()));
+    results["encoder_queue_size"] = sdk::ProtoValue(static_cast<int>(frame_queue_.size()));
+    results["encoder_threads"] = sdk::ProtoValue(num_encoder_threads_);
     
-    return result;
+    auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::high_resolution_clock::now() - start_time_).count();
+    if (elapsed_s > 0) {
+        results["actual_fps"] = sdk::ProtoValue(static_cast<double>(frames_encoded_.load()) / elapsed_s);
+    } else {
+        results["actual_fps"] = sdk::ProtoValue(0.0);
+    }
+    return results;
 }
 
-std::vector<sdk::GeometryConfig> VideoStreamCamera::get_geometries(const sdk::ProtoStruct& extra) {
-    return {};
-}
-
-// Factory method
-std::shared_ptr<sdk::Resource> VideoStreamCamera::create(const sdk::Dependencies& deps,
-                                                         const sdk::ResourceConfig& cfg) {
-    return std::make_shared<VideoStreamCamera>(deps, cfg);
-}
+std::vector<sdk::GeometryConfig> VideoStreamCamera::get_geometries(const sdk::ProtoStruct& extra) { return {}; }
 
 } // namespace video_stream
 } // namespace viam

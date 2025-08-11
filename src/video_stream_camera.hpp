@@ -9,6 +9,8 @@
 #include <chrono>
 #include <mutex>
 #include <condition_variable>
+#include <vector>
+#include <queue>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -22,92 +24,117 @@ extern "C" {
 namespace viam {
 namespace video_stream {
 
-class FramePool;
+/**
+ * @struct EncodingTask
+ * @brief Represents a unit of work for an encoder thread.
+ *
+ * Contains a raw, decoded AVFrame that needs to be encoded into a JPEG.
+ */
+struct EncodingTask {
+    AVFrame* frame;
+};
 
+/**
+ * @class VideoStreamCamera
+ * @brief A high-performance Viam camera that replays a video file using a parallel architecture.
+ *
+ * This component uses a producer-consumer model to achieve high frame rates.
+ * A single producer thread decodes the video, and a pool of consumer threads
+ * handles the computationally expensive JPEG encoding in parallel.
+ */
 class VideoStreamCamera : public sdk::Camera, public sdk::Reconfigurable {
 public:
     VideoStreamCamera(const sdk::Dependencies& deps, const sdk::ResourceConfig& cfg);
-    ~VideoStreamCamera();
+    ~VideoStreamCamera() override;
 
-    // Camera API implementation
+    // Viam Camera API
     sdk::Camera::raw_image get_image(std::string mime_type, const sdk::ProtoStruct& extra) override;
     sdk::Camera::image_collection get_images() override;
     sdk::Camera::point_cloud get_point_cloud(std::string mime_type, const sdk::ProtoStruct& extra) override;
     sdk::Camera::properties get_properties() override;
     
-    // Reconfigurable
+    // Viam Reconfigurable
     void reconfigure(const sdk::Dependencies& deps, const sdk::ResourceConfig& cfg) override;
     
-    // Resource interface
+    // Viam Resource API
     sdk::ProtoStruct do_command(const sdk::ProtoStruct& command) override;
     std::vector<sdk::GeometryConfig> get_geometries(const sdk::ProtoStruct& extra) override;
 
     // Factory methods
-    static std::shared_ptr<sdk::Resource> create(const sdk::Dependencies& deps,
-                                                  const sdk::ResourceConfig& cfg);
+    static std::shared_ptr<sdk::Resource> create(const sdk::Dependencies& deps, const sdk::ResourceConfig& cfg);
     static sdk::Model model();
 
 private:
-    void decode_thread();
-    void start_streaming();
-    void stop_streaming();
-    bool open_video_file(const std::string& path);
+    // Core pipeline control
+    void start_pipeline();
+    void stop_pipeline();
+    bool initialize_decoder(const std::string& path);
     
-    // --- MJPEG Encoding Pipeline ---
-    bool init_mjpeg_encoder(int w, int h);
-    bool encode_frame_to_jpeg(AVFrame* src, std::vector<uint8_t>& out_jpeg);
-    bool ensure_yuvj_frame_from_current(AVFrame* src, AVFrame** out);
+    // Producer thread (decoding)
+    void producer_thread_func();
     
-    // --- Hardware Acceleration (VideoToolbox) ---
+    // Consumer threads (encoding)
+    bool initialize_encoder_pool(int width, int height);
+    void cleanup_encoder_pool();
+    void consumer_thread_func(int thread_id);
+    bool encode_task(int thread_id, EncodingTask& task, std::vector<uint8_t>& jpeg_buffer);
+    
+    // Hardware Acceleration (VideoToolbox for macOS)
 #ifdef USE_VIDEOTOOLBOX
     AVBufferRef* hw_device_ctx_{nullptr};
     static enum AVPixelFormat get_hw_format(AVCodecContext* ctx, const enum AVPixelFormat* pix_fmts);
-    bool init_hw_device();
-    bool transfer_hwframe_if_needed(AVFrame* src, AVFrame* dst);
+    bool initialize_hw_decoder_internal();
+    bool transfer_hw_frame_to_sw(AVFrame* src, AVFrame* dst);
 #endif
-    
+
+    // --- Member Variables ---
+
     // Configuration
     std::string video_path_;
     bool loop_playback_{true};
     int target_fps_{0};
+    int quality_level_{15}; // JPEG quality (1=best, 31=worst). Higher value for more speed.
     
-    // FFmpeg decoder structures
+    // FFmpeg decoder
     AVFormatContext* format_ctx_{nullptr};
-    AVCodecContext* codec_ctx_{nullptr};
-    const AVCodec* codec_{nullptr};
+    AVCodecContext* decoder_ctx_{nullptr};
+    const AVCodec* decoder_{nullptr};
     int video_stream_index_{-1};
     
-    // MJPEG encoder structures
-    AVCodecContext* mjpeg_enc_ctx_{nullptr};
-    const AVCodec* mjpeg_enc_{nullptr};
-    SwsContext* sws_to_yuvj_ctx_{nullptr};
-    AVFrame* yuvj_frame_{nullptr};
+    // Producer-Consumer Queue
+    std::queue<EncodingTask> frame_queue_;
+    std::mutex queue_mutex_;
+    std::condition_variable queue_producer_cv_;
+    std::condition_variable queue_consumer_cv_;
+    size_t max_queue_size_{10};
     
-    // Frame management
-    std::unique_ptr<FramePool> frame_pool_;
-    std::mutex frame_mutex_;
-    std::condition_variable frame_cv_;
-    AVFrame* current_frame_{nullptr};
+    // Consumer (Encoder) Pool
+    int num_encoder_threads_{4};
+    std::vector<std::thread> encoder_threads_;
+    std::vector<AVCodecContext*> mjpeg_encoder_ctxs_;
+    std::vector<SwsContext*> sws_contexts_;
+    std::vector<AVFrame*> yuv_frames_;
     
-    // Pre-encoded JPEG cache for blazing fast get_image()
+    // State for latest available JPEG
     std::mutex jpeg_mutex_;
-    std::vector<uint8_t> current_jpeg_;
-    bool jpeg_ready_{false};
+    std::vector<uint8_t> latest_jpeg_buffer_;
+    bool is_jpeg_ready_{false};
+    std::condition_variable jpeg_ready_cv_;
     
     // Thread control
-    std::atomic<bool> running_{false};
-    std::thread decode_thread_;
+    std::atomic<bool> is_running_{false};
+    std::thread producer_thread_;
     
     // Performance metrics
     std::atomic<uint64_t> frames_decoded_{0};
-    std::atomic<uint64_t> frames_dropped_{0};
     std::atomic<uint64_t> frames_encoded_{0};
+    std::atomic<uint64_t> frames_dropped_producer_{0};
+    std::atomic<uint64_t> frames_dropped_consumer_{0};
     std::chrono::high_resolution_clock::time_point start_time_;
     
     // Frame timing
     double source_fps_{30.0};
     std::chrono::microseconds frame_duration_;
-    std::chrono::high_resolution_clock::time_point last_frame_time_;
 };
 
 } // namespace video_stream
