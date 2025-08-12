@@ -1,13 +1,13 @@
 {
-  "module_id": "video-stream",
+  "module_id": "video-playback",
   "visibility": "private",
-  "url": "https://github.com/YOUR_USERNAME/viam-video-stream",
-  "description": "High-performance video streaming module for Viam",
+  "url": "https://github.com/hunter-volkman/viam-video-playback",
+  "description": "Camera component for local video file playback",
   "models": [
     {
       "api": "rdk:component:camera",
-      "model": "viam:video-stream:replay"
+      "model": "viam:video-playback:camera"
     }
   ],
-  "entrypoint": "./bin/video-stream-module"
+  "entrypoint": "./bin/video-playback-module"
 }
