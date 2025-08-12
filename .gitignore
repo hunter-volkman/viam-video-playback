@@ -1,0 +1,19 @@
+# CMake files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# Build directory
+build/
+bin/
+
+# Distribution archive
+*.tar.gz
+
+# macOS specific
+.DS_Store
+
+# Editor-specific files
+.vscode/
+*.swp
+*~
