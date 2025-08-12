@@ -2,7 +2,7 @@
 cd "$(dirname "$0")"
 
 # Log startup for debugging
-echo "Starting video-stream-module with args: $@" >> /tmp/video-stream.log
+echo "Starting video-playback-module with args: $@" >> /tmp/video-playback.log
 
 # Run the module with all arguments passed from viam-server
-exec ./bin/video-stream-module "$@"
+exec ./bin/video-playback-module "$@"
