@@ -1,7 +1,7 @@
 # Video Playback Module
 A Viam `camera` component for local video file playback, built with a high-performance, parallelized architecture designed for streaming high-resolution video files.
 
-## Model hunter:video-replay:camera
+## Model `hunter:video-playback:camera`
 This model implements the `rdk:component:camera` API by decoding and streaming a video file.
 
 ### Configuration
@@ -36,7 +36,7 @@ This model implements the `rdk:component:camera` API by decoding and streaming a
 The camera supports the following commands via the `do_command` method:
 
 #### get_stats
-Check the real-time performance and status of the video replay pipeline.
+Check the real-time performance and status of the video playback pipeline.
 
 ```json
 {
