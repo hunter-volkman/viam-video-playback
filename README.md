@@ -1,14 +1,14 @@
-# Video Stream Module
-A Viam module for replaying a local video file as a "high-performance live stream" (for testing).
+# Video Playback Module
+A Viam `camera` component for local video file playback, built with a high-performance, parallelized architecture designed for streaming high-resolution video files.
 
-## Model viam:video-stream:replay
+## Model hunter:video-replay:camera
 This model implements the `rdk:component:camera` API by decoding and streaming a video file.
 
 ### Configuration
 
 ```json
 {
-  "video_path": "test-video.mp4",
+  "video_path": "/Users/hunter.volkman/Developer/viam-video-playback/test-videos/15099728-uhd_3840_2160_25fps.mp4",
   "loop": true,
   "target_fps": 25
 }
@@ -36,7 +36,7 @@ This model implements the `rdk:component:camera` API by decoding and streaming a
 The camera supports the following commands via the `do_command` method:
 
 #### get_stats
-Check the real-time performance and status of the video stream pipeline.
+Check the real-time performance and status of the video replay pipeline.
 
 ```json
 {
@@ -47,12 +47,12 @@ Check the real-time performance and status of the video stream pipeline.
 **Response:**
 ```json
 {
-  "actual_fps": 25.03,
-  "encoder_queue_size": 0,
   "encoder_threads": 4,
-  "frames_decoded": 20956,
-  "frames_encoded": 20954,
+  "frames_decoded": 5085,
+  "frames_encoded": 5085,
+  "frames_dropped_producer": 0,
   "frames_dropped_consumer": 0,
-  "frames_dropped_producer": 2
+  "encoder_queue_size": 0,
+  "actual_fps": 25.049261083743843
 }
 ```
