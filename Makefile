@@ -22,8 +22,13 @@ all: build
 build:
 	mkdir -p $(BUILD_DIR)
 ifeq ($(UNAME_S),Linux)
-	cd $(BUILD_DIR) && cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(VIAM_CPP_SDK_HOME)" -DBoost_ROOT=/usr
+	# For Linux/Jetson, explicitly point to the SDK and the Boost library directory
+	cd $(BUILD_DIR) && cmake .. \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_PREFIX_PATH="$(VIAM_CPP_SDK_HOME)" \
+		-DBoost_LIBRARY_DIR=/usr/lib/aarch64-linux-gnu
 else
+	# Standard build for macOS
 	cd $(BUILD_DIR) && cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(VIAM_CPP_SDK_HOME)"
 endif
 	$(MAKE) -C $(BUILD_DIR) -j$(shell $(NPROC_CMD))
