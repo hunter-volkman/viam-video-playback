@@ -8,13 +8,10 @@
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-
 extern "C" {
 #include <libavutil/opt.h>
 }
-
 #pragma GCC diagnostic pop
-
 
 namespace hunter {
 namespace video_playback {
@@ -91,9 +88,7 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
     decoder_ctx_ = avcodec_alloc_context3(decoder_);
     avcodec_parameters_to_context(decoder_ctx_, video_stream->codecpar);
     
-#ifdef USE_VIDEOTOOLBOX
-    initialize_hw_decoder_internal();
-#endif
+    initialize_hw_decoder();
     
     decoder_ctx_->thread_count = std::max(1u, std::thread::hardware_concurrency());
     decoder_ctx_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
@@ -228,8 +223,7 @@ void VideoPlaybackCamera::producer_thread_func() {
                     frames_decoded_++;
 
                     AVFrame* frame_to_queue = av_frame_alloc();
-#ifdef USE_VIDEOTOOLBOX
-                    if (frame->format == AV_PIX_FMT_VIDEOTOOLBOX) {
+                    if (frame->format == AV_PIX_FMT_VIDEOTOOLBOX || frame->format == AV_PIX_FMT_CUDA) {
                         if (transfer_hw_frame_to_sw(frame, sw_frame)) {
                             av_frame_move_ref(frame_to_queue, sw_frame);
                         } else {
@@ -241,9 +235,6 @@ void VideoPlaybackCamera::producer_thread_func() {
                     } else {
                        av_frame_move_ref(frame_to_queue, frame);
                     }
-#else
-                    av_frame_move_ref(frame_to_queue, frame);
-#endif
 
                     {
                         std::unique_lock<std::mutex> lock(queue_mutex_);
@@ -306,7 +297,6 @@ void VideoPlaybackCamera::consumer_thread_func(int thread_id) {
 bool VideoPlaybackCamera::encode_task(int thread_id, EncodingTask& task, std::vector<uint8_t>& jpeg_buffer) {
     AVFrame* yuv_frame = yuv_frames_[thread_id];
     
-    // SWS context lazy initialization per thread
     if (!sws_contexts_[thread_id]) {
         sws_contexts_[thread_id] = sws_getContext(
             task.frame->width, task.frame->height, (AVPixelFormat)task.frame->format,
@@ -315,7 +305,6 @@ bool VideoPlaybackCamera::encode_task(int thread_id, EncodingTask& task, std::ve
         
         if (!sws_contexts_[thread_id]) return false;
 
-        // Set the color range to full (JPEG)
         av_opt_set_int(sws_contexts_[thread_id], "src_range", 1, 0);
         av_opt_set_int(sws_contexts_[thread_id], "dst_range", 1, 0);
     }
@@ -337,25 +326,48 @@ bool VideoPlaybackCamera::encode_task(int thread_id, EncodingTask& task, std::ve
     return false;
 }
 
-#ifdef USE_VIDEOTOOLBOX
-enum AVPixelFormat VideoPlaybackCamera::get_hw_format(AVCodecContext* ctx, const enum AVPixelFormat* pix_fmts) {
+#if defined(USE_VIDEOTOOLBOX)
+enum AVPixelFormat VideoPlaybackCamera::get_hw_format_videotoolbox(AVCodecContext* ctx, const enum AVPixelFormat* pix_fmts) {
     for (const enum AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
         if (*p == AV_PIX_FMT_VIDEOTOOLBOX) return *p;
     }
     return AV_PIX_FMT_NONE;
 }
+#elif defined(USE_NVDEC)
+enum AVPixelFormat VideoPlaybackCamera::get_hw_format_nvdec(AVCodecContext* ctx, const enum AVPixelFormat* pix_fmts) {
+    for (const enum AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
+        if (*p == AV_PIX_FMT_CUDA) return *p;
+    }
+    return AV_PIX_FMT_NONE;
+}
+#endif
 
-bool VideoPlaybackCamera::initialize_hw_decoder_internal() {
-    if (av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, nullptr, nullptr, 0) < 0) return false;
+bool VideoPlaybackCamera::initialize_hw_decoder() {
+#if defined(USE_VIDEOTOOLBOX)
+    decoder_ctx_->get_format = &VideoPlaybackCamera::get_hw_format_videotoolbox;
+    if (av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, nullptr, nullptr, 0) < 0) {
+        std::cerr << "Warning: Failed to create VideoToolbox hardware device; using software decoding." << std::endl;
+        return false;
+    }
+#elif defined(USE_NVDEC)
+    decoder_ctx_->get_format = &VideoPlaybackCamera::get_hw_format_nvdec;
+    if (av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0) < 0) {
+        std::cerr << "Warning: Failed to create CUDA hardware device; using software decoding." << std::endl;
+        return false;
+    }
+#endif
+
+#if defined(USE_VIDEOTOOLBOX) || defined(USE_NVDEC)
     decoder_ctx_->hw_device_ctx = av_buffer_ref(hw_device_ctx_);
-    decoder_ctx_->get_format = &VideoPlaybackCamera::get_hw_format;
     return true;
+#else
+    return false;
+#endif
 }
 
 bool VideoPlaybackCamera::transfer_hw_frame_to_sw(AVFrame* src, AVFrame* dst) {
     return av_hwframe_transfer_data(dst, src, 0) >= 0;
 }
-#endif
 
 vs::Camera::raw_image VideoPlaybackCamera::get_image(std::string mime_type, const vs::ProtoStruct& extra) {
     std::unique_lock<std::mutex> lock(jpeg_mutex_);
