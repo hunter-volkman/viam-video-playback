@@ -22,7 +22,7 @@ all: build
 build:
 	mkdir -p $(BUILD_DIR)
 ifeq ($(UNAME_S),Linux)
-	cd $(BUILD_DIR) && cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(VIAM_CPP_SDK_HOME);/usr"
+	cd $(BUILD_DIR) && cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(VIAM_CPP_SDK_HOME)" -DBoost_ROOT=/usr
 else
 	cd $(BUILD_DIR) && cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(VIAM_CPP_SDK_HOME)"
 endif
