@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.25)
+cmake_minimum_required(VERSION 3.22)
 project(viam-video-playback)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Performance optimizations
 if(CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
-    # Apple Silicon & NVIDIA Jetson optimizations
+    # Apple Silicon & Jetson optimizations
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
 else()
     # x86_64 optimizations
