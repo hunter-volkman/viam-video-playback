@@ -6,6 +6,16 @@
 #include <vector>
 #include <string>
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+
+extern "C" {
+#include <libavutil/opt.h>
+}
+
+#pragma GCC diagnostic pop
+
+
 namespace hunter {
 namespace video_playback {
 
@@ -97,7 +107,7 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
     std::cout << "Decoder initialized successfully:" << std::endl;
     std::cout << "  - Resolution: " << decoder_ctx_->width << "x" << decoder_ctx_->height << std::endl;
     std::cout << "  - Pacing at " << fps << " FPS" << std::endl;
-    std::cout << "  - HW Accel: " << (decoder_ctx_->hw_device_ctx ? "Enabled" : "Software") << std::endl;
+    std::cout << "  - Hardware acceleration: " << (decoder_ctx_->hw_device_ctx ? "Enabled" : "Software") << std::endl;
 
     return true;
 }
@@ -296,14 +306,20 @@ void VideoPlaybackCamera::consumer_thread_func(int thread_id) {
 bool VideoPlaybackCamera::encode_task(int thread_id, EncodingTask& task, std::vector<uint8_t>& jpeg_buffer) {
     AVFrame* yuv_frame = yuv_frames_[thread_id];
     
+    // SWS context lazy initialization per thread
     if (!sws_contexts_[thread_id]) {
         sws_contexts_[thread_id] = sws_getContext(
             task.frame->width, task.frame->height, (AVPixelFormat)task.frame->format,
-            yuv_frame->width, yuv_frame->height, AV_PIX_FMT_YUVJ420P,
+            yuv_frame->width, yuv_frame->height, AV_PIX_FMT_YUV420P,
             SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
-    }
-    if (!sws_contexts_[thread_id]) return false;
+        
+        if (!sws_contexts_[thread_id]) return false;
 
+        // Set the color range to full (JPEG)
+        av_opt_set_int(sws_contexts_[thread_id], "src_range", 1, 0);
+        av_opt_set_int(sws_contexts_[thread_id], "dst_range", 1, 0);
+    }
+    
     sws_scale(sws_contexts_[thread_id], task.frame->data, task.frame->linesize, 0,
               task.frame->height, yuv_frame->data, yuv_frame->linesize);
 
