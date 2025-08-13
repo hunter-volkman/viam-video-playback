@@ -26,8 +26,8 @@ ifeq ($(UNAME_S),Linux)
 	cd $(BUILD_DIR) && cmake .. \
 		-DCMAKE_BUILD_TYPE=Release \
 		-DCMAKE_PREFIX_PATH="$(VIAM_CPP_SDK_HOME)" \
-		-DBoost_LIBRARY_DIR=/usr/lib/aarch64-linux-gnu \
-		-DBoost_INCLUDE_DIR=/usr/include
+		-DBoost_INCLUDE_DIR=/usr/local/include \
+		-DBoost_LIBRARY_DIR=/usr/local/lib
 else
 	# Standard build for macOS
 	cd $(BUILD_DIR) && cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(VIAM_CPP_SDK_HOME)"
