@@ -76,7 +76,7 @@ private:
     
     AVFormatContext* format_ctx_{nullptr};
     AVCodecContext* decoder_ctx_{nullptr};
-    const AVCodec* decoder_{nullptr};
+    AVCodec* decoder_{nullptr}; // This line was changed
     int video_stream_index_{-1};
     
     std::queue<EncodingTask> frame_queue_;
