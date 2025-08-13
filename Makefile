@@ -22,11 +22,12 @@ all: build
 build:
 	mkdir -p $(BUILD_DIR)
 ifeq ($(UNAME_S),Linux)
-	# For Linux/Jetson, explicitly point to the SDK and the Boost library directory
+	# For Linux/Jetson, explicitly point to the SDK, Boost libraries, and Boost headers
 	cd $(BUILD_DIR) && cmake .. \
 		-DCMAKE_BUILD_TYPE=Release \
 		-DCMAKE_PREFIX_PATH="$(VIAM_CPP_SDK_HOME)" \
-		-DBoost_LIBRARY_DIR=/usr/lib/aarch64-linux-gnu
+		-DBoost_LIBRARY_DIR=/usr/lib/aarch64-linux-gnu \
+		-DBoost_INCLUDE_DIR=/usr/include
 else
 	# Standard build for macOS
 	cd $(BUILD_DIR) && cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(VIAM_CPP_SDK_HOME)"
