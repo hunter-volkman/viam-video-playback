@@ -5,15 +5,15 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Performance optimizations
-if(CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
-    # Apple Silicon optimizations
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -mcpu=apple-m1 -mtune=apple-m1")
+if(CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+    # Apple Silicon & NVIDIA Jetson optimizations
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
 else()
     # x86_64 optimizations
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native")
 endif()
 
-# Set RPATH for macOS
+# Set RPATH
 set(CMAKE_MACOSX_RPATH ON)
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
@@ -39,6 +39,12 @@ if(APPLE)
     find_library(COREVIDEO CoreVideo REQUIRED)
     find_library(SECURITY Security REQUIRED)
     find_library(CORESERVICES CoreServices REQUIRED)
+endif()
+
+# Linux Hardware Acceleration for NVIDIA Jetson
+if(LINUX AND (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64"))
+    message(STATUS "ARM64 Linux detected, enabling NVIDIA NVDEC support.")
+    add_definitions(-DUSE_NVDEC)
 endif()
 
 # Create executable
@@ -92,5 +98,8 @@ message(STATUS "System: ${CMAKE_SYSTEM_NAME}")
 message(STATUS "Processor: ${CMAKE_SYSTEM_PROCESSOR}")
 if(APPLE)
     message(STATUS "VideoToolbox: Enabled")
+endif()
+if(LINUX AND (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64"))
+    message(STATUS "NVIDIA NVDEC: Enabled")
 endif()
 message(STATUS "===========================================")
