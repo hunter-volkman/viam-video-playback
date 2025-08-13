@@ -21,7 +21,7 @@ all: build
 # Build the module using CMake
 build:
 	mkdir -p $(BUILD_DIR)
-	cd $(BUILD_DIR) && cmake .. -DCMAKE_BUILD_TYPE=Release
+	cd $(BUILD_DIR) && cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=$(VIAM_CPP_SDK_HOME)
 	$(MAKE) -C $(BUILD_DIR) -j$(shell $(NPROC_CMD))
 
 # Create the distributable .tar.gz archive
