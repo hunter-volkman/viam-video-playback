@@ -82,20 +82,34 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
     if (avformat_open_input(&format_ctx_, path.c_str(), nullptr, nullptr) < 0) return false;
     if (avformat_find_stream_info(format_ctx_, nullptr) < 0) return false;
 
-    // Find the best video stream and the default decoder for it.
-    video_stream_index_ = av_find_best_stream(format_ctx_, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder_, 0);
+    video_stream_index_ = av_find_best_stream(format_ctx_, AVMEDIA_TYPE_VIDEO, -1, -1, const_cast<const AVCodec**>(&decoder_), 0);
     if (video_stream_index_ < 0) return false;
 
     AVStream* video_stream = format_ctx_->streams[video_stream_index_];
     source_fps_ = av_q2d(video_stream->r_frame_rate);
     
 #if defined(USE_NVDEC)
-    // If we are on a Jetson and the video is H.264, try to use the NVIDIA hardware decoder.
     if (video_stream->codecpar->codec_id == AV_CODEC_ID_H264) {
-        AVCodec* h264_nvmpi_decoder = avcodec_find_decoder_by_name("h264_nvmpi");
+        const AVCodec* h264_nvmpi_decoder = avcodec_find_decoder_by_name("h264_nvmpi");
         if (h264_nvmpi_decoder) {
             decoder_ = h264_nvmpi_decoder;
             std::cout << "Using NVIDIA h264_nvmpi hardware decoder." << std::endl;
+
+            const AVBitStreamFilter* bsf = av_bsf_get_by_name("h264_mp4toannexb");
+            if (!bsf) {
+                std::cerr << "Error: failed to find h264_mp4toannexb bitstream filter." << std::endl;
+                return false;
+            }
+            if (av_bsf_alloc(bsf, &bsf_ctx_) < 0) return false;
+            if (avcodecpar_copy(bsf_ctx_->par_in, video_stream->codecpar) < 0) {
+                av_bsf_free(&bsf_ctx_);
+                return false;
+            }
+            if (av_bsf_init(bsf_ctx_) < 0) {
+                av_bsf_free(&bsf_ctx_);
+                return false;
+            }
+            std::cout << "Initialized h264_mp4toannexb bitstream filter." << std::endl;
         } else {
             std::cerr << "NVIDIA h264_nvmpi decoder not found. Falling back to default." << std::endl;
         }
@@ -103,6 +117,7 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
 #endif
 
     decoder_ctx_ = avcodec_alloc_context3(decoder_);
+    if (!decoder_ctx_) return false;
     avcodec_parameters_to_context(decoder_ctx_, video_stream->codecpar);
     
     initialize_hw_decoder();
@@ -192,6 +207,11 @@ void VideoPlaybackCamera::stop_pipeline() {
     if (producer_thread_.joinable()) producer_thread_.join();
     for (auto& t : encoder_threads_) if (t.joinable()) t.join();
     encoder_threads_.clear();
+
+    if (bsf_ctx_) {
+        av_bsf_free(&bsf_ctx_);
+        bsf_ctx_ = nullptr;
+    }
     
     cleanup_encoder_pool();
     if (decoder_ctx_) {
@@ -227,44 +247,33 @@ void VideoPlaybackCamera::producer_thread_func() {
         }
 
         if (packet->stream_index == video_stream_index_) {
-            int ret = avcodec_send_packet(decoder_ctx_, packet);
-            if (ret >= 0) {
-                while (ret >= 0) {
-                    ret = avcodec_receive_frame(decoder_ctx_, frame);
-                    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
-                    if (ret < 0) break;
-                    if (!is_running_) break;
-
-                    std::this_thread::sleep_until(next_frame_time);
-                    next_frame_time += frame_duration_;
-                    frames_decoded_++;
-
-                    AVFrame* frame_to_queue = av_frame_alloc();
-                    if (frame->format == AV_PIX_FMT_VIDEOTOOLBOX || frame->format == AV_PIX_FMT_CUDA) {
-                        if (transfer_hw_frame_to_sw(frame, sw_frame)) {
-                            av_frame_move_ref(frame_to_queue, sw_frame);
-                        } else {
-                            frames_dropped_producer_++;
-                            av_frame_free(&frame_to_queue);
-                            av_frame_unref(frame);
-                            continue;
-                        }
-                    } else {
-                       av_frame_move_ref(frame_to_queue, frame);
+            int ret = 0;
+            // Apply the filter if it has been initialized (i.e., we're using NVDEC)
+            if (bsf_ctx_) {
+                ret = av_bsf_send_packet(bsf_ctx_, packet);
+                if (ret < 0) {
+                    av_packet_unref(packet);
+                    continue;
+                }
+                
+                // Receive all filtered packets
+                while ((ret = av_bsf_receive_packet(bsf_ctx_, packet)) == 0) {
+                    // This inner loop handles the filtered packet
+                    if (avcodec_send_packet(decoder_ctx_, packet) < 0) {
+                        break; 
                     }
+                    receive_and_queue_frames(frame, sw_frame, next_frame_time);
+                }
 
-                    {
-                        std::unique_lock<std::mutex> lock(queue_mutex_);
-                        if (frame_queue_.size() >= max_queue_size_) {
-                            frames_dropped_producer_++;
-                            av_frame_free(&frame_to_queue);
-                        } else {
-                            frame_queue_.push({frame_to_queue});
-                            lock.unlock();
-                            queue_consumer_cv_.notify_one();
-                        }
-                    }
-                    av_frame_unref(frame);
+                if (ret != AVERROR(EAGAIN) && ret < 0) {
+                     std::cerr << "Error receiving packet from bitstream filter" << std::endl;
+                }
+
+            } else {
+                // Original path for non-NVDEC decoders
+                ret = avcodec_send_packet(decoder_ctx_, packet);
+                if (ret >= 0) {
+                    receive_and_queue_frames(frame, sw_frame, next_frame_time);
                 }
             }
         }
@@ -278,6 +287,52 @@ void VideoPlaybackCamera::producer_thread_func() {
     av_frame_free(&sw_frame);
     std::cout << "Producer thread finished." << std::endl;
 }
+
+void VideoPlaybackCamera::receive_and_queue_frames(AVFrame* frame, AVFrame* sw_frame, std::chrono::high_resolution_clock::time_point& next_frame_time) {
+    while (true) {
+        int ret = avcodec_receive_frame(decoder_ctx_, frame);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+        if (ret < 0) {
+            char err_buf[AV_ERROR_MAX_STRING_SIZE] = {0};
+            av_make_error_string(err_buf, AV_ERROR_MAX_STRING_SIZE, ret);
+            std::cerr << "Error receiving frame from decoder: " << err_buf << std::endl;
+            break;
+        }
+        if (!is_running_) break;
+
+        std::this_thread::sleep_until(next_frame_time);
+        next_frame_time += frame_duration_;
+        frames_decoded_++;
+
+        AVFrame* frame_to_queue = av_frame_alloc();
+        if (frame->format == AV_PIX_FMT_VIDEOTOOLBOX || frame->format == AV_PIX_FMT_CUDA) {
+            if (transfer_hw_frame_to_sw(frame, sw_frame)) {
+                av_frame_move_ref(frame_to_queue, sw_frame);
+            } else {
+                frames_dropped_producer_++;
+                av_frame_free(&frame_to_queue);
+                av_frame_unref(frame);
+                continue;
+            }
+        } else {
+           av_frame_move_ref(frame_to_queue, frame);
+        }
+
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex_);
+            if (frame_queue_.size() >= max_queue_size_) {
+                frames_dropped_producer_++;
+                av_frame_free(&frame_to_queue);
+            } else {
+                frame_queue_.push({frame_to_queue});
+                lock.unlock();
+                queue_consumer_cv_.notify_one();
+            }
+        }
+        av_frame_unref(frame);
+    }
+}
+
 
 void VideoPlaybackCamera::consumer_thread_func(int thread_id) {
     std::vector<uint8_t> local_jpeg_buffer;
@@ -355,6 +410,7 @@ enum AVPixelFormat VideoPlaybackCamera::get_hw_format_nvdec(AVCodecContext* ctx,
     for (const enum AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
         if (*p == AV_PIX_FMT_CUDA) return *p;
     }
+    std::cerr << "Failed to find CUDA pixel format." << std::endl;
     return AV_PIX_FMT_NONE;
 }
 #endif
@@ -368,7 +424,7 @@ bool VideoPlaybackCamera::initialize_hw_decoder() {
     }
 #elif defined(USE_NVDEC)
     decoder_ctx_->get_format = &VideoPlaybackCamera::get_hw_format_nvdec;
-    if (av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0) < 0) {
+    if (av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_CUDA, "default", nullptr, 0) < 0) {
         std::cerr << "Warning: Failed to create CUDA hardware device; using software decoding." << std::endl;
         return false;
     }
@@ -391,6 +447,7 @@ vs::Camera::raw_image VideoPlaybackCamera::get_image(std::string mime_type, cons
     if (!jpeg_ready_cv_.wait_for(lock, std::chrono::milliseconds(200), [this] { return is_jpeg_ready_; })) {
         throw vs::Exception("Timeout waiting for frame from stream.");
     }
+    is_jpeg_ready_ = false; // Consume the frame
     vs::Camera::raw_image img;
     img.bytes = latest_jpeg_buffer_;
     img.mime_type = "image/jpeg";

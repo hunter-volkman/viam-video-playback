@@ -15,6 +15,7 @@
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
+#include <libavcodec/bsf.h>
 #include <libswscale/swscale.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
@@ -52,6 +53,7 @@ private:
     bool initialize_decoder(const std::string& path);
     
     void producer_thread_func();
+    void receive_and_queue_frames(AVFrame* frame, AVFrame* sw_frame, std::chrono::high_resolution_clock::time_point& next_frame_time);
     
     bool initialize_encoder_pool(int width, int height);
     void cleanup_encoder_pool();
@@ -60,6 +62,7 @@ private:
     
     // Hardware Acceleration
     AVBufferRef* hw_device_ctx_{nullptr};
+    AVBSFContext* bsf_ctx_{nullptr};
     bool initialize_hw_decoder();
     bool transfer_hw_frame_to_sw(AVFrame* src, AVFrame* dst);
 #if defined(USE_VIDEOTOOLBOX)
@@ -76,7 +79,7 @@ private:
     
     AVFormatContext* format_ctx_{nullptr};
     AVCodecContext* decoder_ctx_{nullptr};
-    AVCodec* decoder_{nullptr}; // This line was changed
+    const AVCodec* decoder_{nullptr};
     int video_stream_index_{-1};
     
     std::queue<EncodingTask> frame_queue_;
