@@ -94,7 +94,8 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
 
 #if defined(USE_NVDEC)
     if (video_stream->codecpar->codec_id == AV_CODEC_ID_H264) {
-        decoder_ = avcodec_find_decoder_by_name("h264_nvmpi");
+        // decoder_ = avcodec_find_decoder_by_name("h264_nvmpi");
+        decoder_ = avcodec_find_decoder_by_name("h264_nvv4l2dec");
         if (decoder_) {
             std::cout << "Successfully found NVIDIA h264_nvmpi hardware decoder." << std::endl;
             const AVBitStreamFilter* bsf = av_bsf_get_by_name("h264_mp4toannexb");
