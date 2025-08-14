@@ -435,8 +435,10 @@ bool VideoPlaybackCamera::initialize_hw_decoder(int width, int height) {
     // The h264_nvv4l2dec decoder requires a DRM hardware context, not a CUDA one.
     const AVCodec* current_decoder = decoder_ctx_->codec;
     if (std::string(current_decoder->name) == "h264_nvv4l2dec") {
-        if (av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_DRM, nullptr, nullptr, 0) < 0) {
-            std::cerr << "Error: Failed to create DRM hardware device for V4L2." << std::endl;
+        // THIS IS THE FIX: Explicitly set the DRM device path
+        const char* drm_device = "/dev/dri/renderD128";
+        if (av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_DRM, drm_device, nullptr, 0) < 0) {
+            std::cerr << "Error: Failed to create DRM hardware device for V4L2 using " << drm_device << "." << std::endl;
             return false;
         }
 
