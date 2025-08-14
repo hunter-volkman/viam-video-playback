@@ -432,35 +432,39 @@ bool VideoPlaybackCamera::initialize_hw_decoder(int width, int height) {
     }
     decoder_ctx_->hw_device_ctx = av_buffer_ref(hw_device_ctx_);
 #elif defined(USE_NVDEC)
-    // New, explicit hardware setup for NVIDIA
-    if (av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0) < 0) {
-        std::cerr << "Error: Failed to create CUDA hardware device." << std::endl;
-        return false;
-    }
-    
-    if (!(hw_frames_ctx_ = av_hwframe_ctx_alloc(hw_device_ctx_))) {
-        std::cerr << "Error: Failed to allocate hardware frame context." << std::endl;
-        return false;
-    }
+    // The h264_nvv4l2dec decoder requires a DRM hardware context, not a CUDA one.
+    const AVCodec* current_decoder = decoder_ctx_->codec;
+    if (std::string(current_decoder->name) == "h264_nvv4l2dec") {
+        if (av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_DRM, nullptr, nullptr, 0) < 0) {
+            std::cerr << "Error: Failed to create DRM hardware device for V4L2." << std::endl;
+            return false;
+        }
 
-    AVHWFramesContext *frames_ctx = (AVHWFramesContext*)(hw_frames_ctx_->data);
-    frames_ctx->format = AV_PIX_FMT_CUDA;
-    frames_ctx->sw_format = AV_PIX_FMT_YUV420P; // The format after transfer to CPU
-    frames_ctx->width = width;
-    frames_ctx->height = height;
-    frames_ctx->initial_pool_size = 20;
+        if (!(hw_frames_ctx_ = av_hwframe_ctx_alloc(hw_device_ctx_))) {
+            std::cerr << "Error: Failed to allocate hardware frame context." << std::endl;
+            return false;
+        }
 
-    if (av_hwframe_ctx_init(hw_frames_ctx_) < 0) {
-        std::cerr << "Error: Failed to initialize hardware frame context." << std::endl;
-        av_buffer_unref(&hw_frames_ctx_);
-        return false;
-    }
-    
-    // This is the crucial step: associate the frames context with the decoder context
-    decoder_ctx_->hw_frames_ctx = av_buffer_ref(hw_frames_ctx_);
-    if (!decoder_ctx_->hw_frames_ctx) {
-        std::cerr << "Error: Failed to set hardware frames context." << std::endl;
-        return false;
+        AVHWFramesContext *frames_ctx = (AVHWFramesContext*)(hw_frames_ctx_->data);
+        frames_ctx->format    = AV_PIX_FMT_DRM_PRIME;
+        frames_ctx->sw_format = AV_PIX_FMT_YUV420P;
+        frames_ctx->width     = width;
+        frames_ctx->height    = height;
+        frames_ctx->initial_pool_size = 20;
+
+        if (av_hwframe_ctx_init(hw_frames_ctx_) < 0) {
+            std::cerr << "Error: Failed to initialize hardware frame context." << std::endl;
+            return false;
+        }
+        decoder_ctx_->hw_frames_ctx = av_buffer_ref(hw_frames_ctx_);
+
+    } else {
+         // Fallback or other NVIDIA decoders can still try CUDA
+        if (av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0) < 0) {
+            std::cerr << "Error: Failed to create CUDA hardware device." << std::endl;
+            return false;
+        }
+        // CUDA setup would go here if we supported other decoders like the original 'h264_nvmpi'
     }
 #endif
     return true;
