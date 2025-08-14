@@ -192,7 +192,7 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
     // Check if hardware acceleration was ACTUALLY enabled.
     if (decoder_ctx_->hw_device_ctx) {
         AVHWDeviceContext* dev_ctx = (AVHWDeviceContext*)decoder_ctx_->hw_device_ctx->data;
-        std::cout << "  - Hardware acceleration: Enabled (via hw_device_ctx, type: " << av_hwdevice_type_name(dev_ctx->type) << ")" << std::endl;
+        std::cout << "  - Hardware acceleration: Enabled (via hw_device_ctx, type: " << av_hwdevice_get_type_name(dev_ctx->type) << ")" << std::endl;
     } else if (decoder_ctx_->hw_frames_ctx) {
          std::cout << "  - Hardware acceleration: Enabled (via hw_frames_ctx)" << std::endl;
     } else {
