@@ -94,10 +94,9 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
 
 #if defined(USE_NVDEC)
     if (video_stream->codecpar->codec_id == AV_CODEC_ID_H264) {
-        // decoder_ = avcodec_find_decoder_by_name("h264_nvmpi");
-        decoder_ = avcodec_find_decoder_by_name("h264_nvv4l2dec");
+        decoder_ = avcodec_find_decoder_by_name("h264_nvv4l2dec"); // Prefer V4L2 decoder
         if (decoder_) {
-            std::cout << "Successfully found NVIDIA h264_nvmpi hardware decoder." << std::endl;
+            std::cout << "Successfully found NVIDIA h264_nvv4l2dec hardware decoder." << std::endl;
             const AVBitStreamFilter* bsf = av_bsf_get_by_name("h264_mp4toannexb");
             if (bsf) {
                 av_bsf_alloc(bsf, &bsf_ctx_);
@@ -123,8 +122,10 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
     if (!decoder_ctx_) return false;
     avcodec_parameters_to_context(decoder_ctx_, video_stream->codecpar);
 
-    // Initialize HW acceleration only if we are using a hardware decoder
-    if (decoder_->type == AVMEDIA_TYPE_VIDEO && decoder_->id == AV_CODEC_ID_H264 && std::string(decoder_->name) == "h264_nvmpi") {
+    // Initialize HW acceleration only if we are using a known NVIDIA hardware decoder
+    std::string decoder_name(decoder_->name);
+    if (decoder_->type == AVMEDIA_TYPE_VIDEO && decoder_->id == AV_CODEC_ID_H264 &&
+       (decoder_name == "h264_nvmpi" || decoder_name == "h264_nvv4l2dec")) {
         initialize_hw_decoder(decoder_ctx_->width, decoder_ctx_->height);
     }
 
