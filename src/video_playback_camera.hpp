@@ -64,7 +64,6 @@ private:
     AVBufferRef* hw_device_ctx_{nullptr};
     AVBufferRef* hw_frames_ctx_{nullptr};
     AVBSFContext* bsf_ctx_{nullptr};
-    bool initialize_hw_decoder(int width, int height);
     bool transfer_hw_frame_to_sw(AVFrame* src, AVFrame* dst);
 #if defined(USE_VIDEOTOOLBOX)
     static enum AVPixelFormat get_hw_format_videotoolbox(AVCodecContext* ctx, const enum AVPixelFormat* pix_fmts);
