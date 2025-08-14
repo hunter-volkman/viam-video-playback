@@ -97,90 +97,91 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
     video_stream_index_ = stream_idx;
     AVStream* video_stream = format_ctx_->streams[video_stream_index_];
     source_fps_ = av_q2d(video_stream->r_frame_rate);
-    bool use_nvv4l2dec = false;
+    bool is_hw_decoder = false;
 
 #if defined(USE_NVDEC)
     if (video_stream->codecpar->codec_id == AV_CODEC_ID_H264) {
-        // Strategy: Try the older, more stable MPI decoder first.
-        decoder_ = avcodec_find_decoder_by_name("h264_nvmpi");
+        decoder_ = avcodec_find_decoder_by_name("h264_nvv4l2dec");
         if (decoder_) {
-            std::cout << "Found legacy NVIDIA h264_nvmpi hardware decoder." << std::endl;
-        } else {
-            std::cout << "Legacy h264_nvmpi decoder not found. Trying modern h264_nvv4l2dec." << std::endl;
-            decoder_ = avcodec_find_decoder_by_name("h264_nvv4l2dec");
-            if (decoder_) {
-                 std::cout << "Found modern NVIDIA h264_nvv4l2dec hardware decoder." << std::endl;
-                 use_nvv4l2dec = true;
-            }
-        }
-
-        // The h264_mp4toannexb bitstream filter is required for H.264 in MP4 containers.
-        if (decoder_) {
-            const AVBitStreamFilter* bsf = av_bsf_get_by_name("h264_mp4toannexb");
-            if (bsf) {
-                av_bsf_alloc(bsf, &bsf_ctx_);
-                avcodec_parameters_copy(bsf_ctx_->par_in, video_stream->codecpar);
-                av_bsf_init(bsf_ctx_);
-                std::cout << "Initialized h264_mp4toannexb bitstream filter." << std::endl;
-            } else {
-                 std::cerr << "Warning: Could not find h264_mp4toannexb bitstream filter." << std::endl;
-            }
+            std::cout << "Found NVIDIA h264_nvv4l2dec hardware decoder." << std::endl;
+            is_hw_decoder = true;
         }
     }
 #endif
 
+    // If no hardware decoder was found, find the default software one.
     if (!decoder_) {
-        std::cout << "No hardware decoder found or enabled. Falling back to default software decoder." << std::endl;
         decoder_ = avcodec_find_decoder(video_stream->codecpar->codec_id);
-        if (!decoder_) {
-            std::cerr << "Error: Failed to find any decoder for the video stream." << std::endl;
-            return false;
-        }
+    }
+    
+    if (!decoder_) {
+        std::cerr << "Fatal: Failed to find any decoder for the video stream." << std::endl;
+        return false;
     }
 
     decoder_ctx_ = avcodec_alloc_context3(decoder_);
     if (!decoder_ctx_) return false;
     avcodec_parameters_to_context(decoder_ctx_, video_stream->codecpar);
 
-#if defined(USE_NVDEC)
-    if (use_nvv4l2dec) {
-        std::cout << "Attempting to initialize hardware context for h264_nvv4l2dec..." << std::endl;
+    // If it's a hardware decoder, attempt to set up the hardware context.
+    if (is_hw_decoder) {
         const char* drm_device = "/dev/dri/renderD128";
         if (av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_DRM, drm_device, nullptr, 0) < 0) {
-            std::cerr << "Error: Failed to create DRM hardware device. Will use software decoding." << std::endl;
+            std::cerr << "Warning: Failed to create DRM hardware device. Will attempt to proceed without it." << std::endl;
         } else {
-            if (!(hw_frames_ctx_ = av_hwframe_ctx_alloc(hw_device_ctx_))) {
-                 std::cerr << "Error: Failed to allocate hardware frame context. Will use software decoding." << std::endl;
-            } else {
+            if ((hw_frames_ctx_ = av_hwframe_ctx_alloc(hw_device_ctx_))) {
                 AVHWFramesContext *frames_ctx = (AVHWFramesContext*)(hw_frames_ctx_->data);
                 frames_ctx->format    = AV_PIX_FMT_DRM_PRIME;
                 frames_ctx->sw_format = AV_PIX_FMT_NV12;
                 frames_ctx->width     = decoder_ctx_->width;
                 frames_ctx->height    = decoder_ctx_->height;
                 frames_ctx->initial_pool_size = 20;
-
-                if (av_hwframe_ctx_init(hw_frames_ctx_) < 0) {
-                    std::cerr << "Error: Failed to initialize hardware frame context. Will use software decoding." << std::endl;
-                    av_buffer_unref(&hw_frames_ctx_); // This sets it to NULL
-                } else {
+                if (av_hwframe_ctx_init(hw_frames_ctx_) == 0) {
                     decoder_ctx_->hw_frames_ctx = av_buffer_ref(hw_frames_ctx_);
-                    std::cout << "Successfully initialized DRM hardware frame context." << std::endl;
+                } else {
+                    std::cerr << "Warning: Failed to initialize hardware frame context." << std::endl;
+                    av_buffer_unref(&hw_frames_ctx_);
                 }
             }
         }
-    } else if (decoder_ && std::string(decoder_->name) == "h264_nvmpi") {
-        std::cout << "Skipping manual hardware context setup for h264_nvmpi (handled by avcodec_open2)." << std::endl;
     }
-#endif
+
+    // This is our robust fallback logic. If opening the chosen decoder fails
+    // (e.g., NvMMLite error), we will explicitly switch to the basic software decoder.
+    if (avcodec_open2(decoder_ctx_, decoder_, nullptr) < 0) {
+        std::cerr << "Error: Failed to open initial codec '" << decoder_->name << "'. Forcing software fallback." << std::endl;
+        avcodec_free_context(&decoder_ctx_);
+        
+        const AVCodec* sw_decoder = avcodec_find_decoder(AV_CODEC_ID_H264);
+        if (!sw_decoder) {
+            std::cerr << "Fatal: Could not find even the basic H.264 software decoder." << std::endl;
+            return false;
+        }
+        decoder_ = sw_decoder;
+        is_hw_decoder = false; // We are no longer using a hardware decoder
+
+        decoder_ctx_ = avcodec_alloc_context3(decoder_);
+        avcodec_parameters_to_context(decoder_ctx_, video_stream->codecpar);
+
+        if (avcodec_open2(decoder_ctx_, decoder_, nullptr) < 0) {
+            std::cerr << "Fatal: Failed to open the software fallback codec. Cannot continue." << std::endl;
+            return false;
+        }
+    }
+    
+    // Always initialize the bitstream filter for h264 in mp4
+    if (video_stream->codecpar->codec_id == AV_CODEC_ID_H264) {
+        const AVBitStreamFilter* bsf = av_bsf_get_by_name("h264_mp4toannexb");
+        if (bsf) {
+            av_bsf_alloc(bsf, &bsf_ctx_);
+            avcodec_parameters_copy(bsf_ctx_->par_in, video_stream->codecpar);
+            av_bsf_init(bsf_ctx_);
+        }
+    }
 
     decoder_ctx_->thread_count = std::max(1u, std::thread::hardware_concurrency());
     decoder_ctx_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
-
-    if (avcodec_open2(decoder_ctx_, decoder_, nullptr) < 0) {
-        std::cerr << "Error: Failed to open codec." << std::endl;
-        return false;
-    }
-
+    
     double fps = (target_fps_ > 0) ? target_fps_ : source_fps_;
     frame_duration_ = std::chrono::microseconds(static_cast<int64_t>(1000000.0 / fps));
 
@@ -189,12 +190,9 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
     std::cout << "  - Resolution: " << decoder_ctx_->width << "x" << decoder_ctx_->height << std::endl;
     std::cout << "  - Pacing at " << fps << " FPS" << std::endl;
     
-    // Check if hardware acceleration was ACTUALLY enabled.
     if (decoder_ctx_->hw_device_ctx) {
         AVHWDeviceContext* dev_ctx = (AVHWDeviceContext*)decoder_ctx_->hw_device_ctx->data;
-        std::cout << "  - Hardware acceleration: Enabled (via hw_device_ctx, type: " << av_hwdevice_get_type_name(dev_ctx->type) << ")" << std::endl;
-    } else if (decoder_ctx_->hw_frames_ctx) {
-         std::cout << "  - Hardware acceleration: Enabled (via hw_frames_ctx)" << std::endl;
+        std::cout << "  - Hardware acceleration: Enabled (type: " << av_hwdevice_get_type_name(dev_ctx->type) << ")" << std::endl;
     } else {
          std::cout << "  - Hardware acceleration: Software" << std::endl;
     }
