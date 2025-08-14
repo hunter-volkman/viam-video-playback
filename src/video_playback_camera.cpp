@@ -82,51 +82,59 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
     if (avformat_open_input(&format_ctx_, path.c_str(), nullptr, nullptr) < 0) return false;
     if (avformat_find_stream_info(format_ctx_, nullptr) < 0) return false;
 
-    video_stream_index_ = av_find_best_stream(format_ctx_, AVMEDIA_TYPE_VIDEO, -1, -1, const_cast<AVCodec**>(&decoder_), 0);
-    if (video_stream_index_ < 0) return false;
-
+    // Find the video stream
+    int stream_idx = av_find_best_stream(format_ctx_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    if (stream_idx < 0) {
+        std::cerr << "Cannot find video stream in the input file" << std::endl;
+        return false;
+    }
+    video_stream_index_ = stream_idx;
     AVStream* video_stream = format_ctx_->streams[video_stream_index_];
     source_fps_ = av_q2d(video_stream->r_frame_rate);
-    
+
 #if defined(USE_NVDEC)
     if (video_stream->codecpar->codec_id == AV_CODEC_ID_H264) {
-        const AVCodec* h264_nvmpi_decoder = avcodec_find_decoder_by_name("h264_nvmpi");
-        if (h264_nvmpi_decoder) {
-            decoder_ = h264_nvmpi_decoder;
-            std::cout << "Using NVIDIA h264_nvmpi hardware decoder." << std::endl;
-
+        decoder_ = avcodec_find_decoder_by_name("h264_nvmpi");
+        if (decoder_) {
+            std::cout << "Successfully found NVIDIA h264_nvmpi hardware decoder." << std::endl;
             const AVBitStreamFilter* bsf = av_bsf_get_by_name("h264_mp4toannexb");
-            if (!bsf) {
-                std::cerr << "Error: failed to find h264_mp4toannexb bitstream filter." << std::endl;
-                return false;
+            if (bsf) {
+                av_bsf_alloc(bsf, &bsf_ctx_);
+                avcodec_parameters_copy(bsf_ctx_->par_in, video_stream->codecpar);
+                av_bsf_init(bsf_ctx_);
+                std::cout << "Initialized h264_mp4toannexb bitstream filter." << std::endl;
             }
-            if (av_bsf_alloc(bsf, &bsf_ctx_) < 0) return false;
-            if (avcodec_parameters_copy(bsf_ctx_->par_in, video_stream->codecpar) < 0) {
-                av_bsf_free(&bsf_ctx_);
-                return false;
-            }
-            if (av_bsf_init(bsf_ctx_) < 0) {
-                av_bsf_free(&bsf_ctx_);
-                return false;
-            }
-            std::cout << "Initialized h264_mp4toannexb bitstream filter." << std::endl;
-        } else {
-            std::cerr << "NVIDIA h264_nvmpi decoder not found. Falling back to default." << std::endl;
         }
     }
 #endif
 
+    // If hardware decoder wasn't found or we're not on a Jetson, find the default decoder
+    if (!decoder_) {
+        std::cout << "Falling back to default software decoder." << std::endl;
+        decoder_ = avcodec_find_decoder(video_stream->codecpar->codec_id);
+        if (!decoder_) {
+            std::cerr << "Failed to find any decoder for the video stream" << std::endl;
+            return false;
+        }
+    }
+
     decoder_ctx_ = avcodec_alloc_context3(decoder_);
     if (!decoder_ctx_) return false;
     avcodec_parameters_to_context(decoder_ctx_, video_stream->codecpar);
-    
-    initialize_hw_decoder(decoder_ctx_->width, decoder_ctx_->height);
-    
+
+    // Initialize HW acceleration only if we are using a hardware decoder
+    if (decoder_->type == AVMEDIA_TYPE_VIDEO && decoder_->id == AV_CODEC_ID_H264 && std::string(decoder_->name) == "h264_nvmpi") {
+        initialize_hw_decoder(decoder_ctx_->width, decoder_ctx_->height);
+    }
+
     decoder_ctx_->thread_count = std::max(1u, std::thread::hardware_concurrency());
     decoder_ctx_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
-    
-    if (avcodec_open2(decoder_ctx_, decoder_, nullptr) < 0) return false;
-    
+
+    if (avcodec_open2(decoder_ctx_, decoder_, nullptr) < 0) {
+        std::cerr << "Failed to open codec" << std::endl;
+        return false;
+    }
+
     double fps = (target_fps_ > 0) ? target_fps_ : source_fps_;
     frame_duration_ = std::chrono::microseconds(static_cast<int64_t>(1000000.0 / fps));
 
