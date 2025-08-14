@@ -126,7 +126,9 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
     std::string decoder_name(decoder_->name);
     if (decoder_->type == AVMEDIA_TYPE_VIDEO && decoder_->id == AV_CODEC_ID_H264 &&
        (decoder_name == "h264_nvmpi" || decoder_name == "h264_nvv4l2dec")) {
-        initialize_hw_decoder(decoder_ctx_->width, decoder_ctx_->height);
+        if (!initialize_hw_decoder(decoder_ctx_->width, decoder_ctx_->height)) {
+            std::cerr << "Warning: Hardware decoder initialization failed. Falling back to software decoding." << std::endl;
+        }
     }
 
     decoder_ctx_->thread_count = std::max(1u, std::thread::hardware_concurrency());
@@ -320,7 +322,8 @@ void VideoPlaybackCamera::receive_and_queue_frames(AVFrame* frame, AVFrame* sw_f
         frames_decoded_++;
 
         AVFrame* frame_to_queue = av_frame_alloc();
-        if (frame->format == AV_PIX_FMT_VIDEOTOOLBOX || frame->format == AV_PIX_FMT_CUDA) {
+        // Check for hardware frame formats
+        if (frame->format == AV_PIX_FMT_DRM_PRIME || frame->format == AV_PIX_FMT_CUDA) {
             if (transfer_hw_frame_to_sw(frame, sw_frame)) {
                 av_frame_move_ref(frame_to_queue, sw_frame);
             } else {
@@ -435,7 +438,6 @@ bool VideoPlaybackCamera::initialize_hw_decoder(int width, int height) {
     // The h264_nvv4l2dec decoder requires a DRM hardware context, not a CUDA one.
     const AVCodec* current_decoder = decoder_ctx_->codec;
     if (std::string(current_decoder->name) == "h264_nvv4l2dec") {
-        // THIS IS THE FIX: Explicitly set the DRM device path
         const char* drm_device = "/dev/dri/renderD128";
         if (av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_DRM, drm_device, nullptr, 0) < 0) {
             std::cerr << "Error: Failed to create DRM hardware device for V4L2 using " << drm_device << "." << std::endl;
@@ -449,7 +451,8 @@ bool VideoPlaybackCamera::initialize_hw_decoder(int width, int height) {
 
         AVHWFramesContext *frames_ctx = (AVHWFramesContext*)(hw_frames_ctx_->data);
         frames_ctx->format    = AV_PIX_FMT_DRM_PRIME;
-        frames_ctx->sw_format = AV_PIX_FMT_YUV420P;
+        // THIS IS THE FIX: Change the software format to what the Jetson hardware expects
+        frames_ctx->sw_format = AV_PIX_FMT_NV12; 
         frames_ctx->width     = width;
         frames_ctx->height    = height;
         frames_ctx->initial_pool_size = 20;
@@ -473,7 +476,11 @@ bool VideoPlaybackCamera::initialize_hw_decoder(int width, int height) {
 }
 
 bool VideoPlaybackCamera::transfer_hw_frame_to_sw(AVFrame* src, AVFrame* dst) {
-    return av_hwframe_transfer_data(dst, src, 0) >= 0;
+    if (av_hwframe_transfer_data(dst, src, 0) < 0) {
+        std::cerr << "Error transferring hardware frame to software frame." << std::endl;
+        return false;
+    }
+    return true;
 }
 
 vs::Camera::raw_image VideoPlaybackCamera::get_image(std::string mime_type, const vs::ProtoStruct& extra) {
