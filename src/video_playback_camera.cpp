@@ -82,21 +82,26 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
     if (avformat_open_input(&format_ctx_, path.c_str(), nullptr, nullptr) < 0) return false;
     if (avformat_find_stream_info(format_ctx_, nullptr) < 0) return false;
 
-#if defined(USE_NVDEC)
-    // On Jetson, explicitly find the NVIDIA hardware decoder.
-    decoder_ = avcodec_find_decoder_by_name("h264_nvmpi");
-    if (!decoder_) {
-        std::cerr << "NVIDIA h264_nvmpi decoder not found. Falling back." << std::endl;
-    }
-#endif
-
-    // Find the best video stream and the corresponding decoder.
+    // Find the best video stream and the default decoder for it.
     video_stream_index_ = av_find_best_stream(format_ctx_, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder_, 0);
     if (video_stream_index_ < 0) return false;
 
     AVStream* video_stream = format_ctx_->streams[video_stream_index_];
     source_fps_ = av_q2d(video_stream->r_frame_rate);
     
+#if defined(USE_NVDEC)
+    // If we are on a Jetson and the video is H.264, try to use the NVIDIA hardware decoder.
+    if (video_stream->codecpar->codec_id == AV_CODEC_ID_H264) {
+        AVCodec* h264_nvmpi_decoder = avcodec_find_decoder_by_name("h264_nvmpi");
+        if (h264_nvmpi_decoder) {
+            decoder_ = h264_nvmpi_decoder;
+            std::cout << "Using NVIDIA h264_nvmpi hardware decoder." << std::endl;
+        } else {
+            std::cerr << "NVIDIA h264_nvmpi decoder not found. Falling back to default." << std::endl;
+        }
+    }
+#endif
+
     decoder_ctx_ = avcodec_alloc_context3(decoder_);
     avcodec_parameters_to_context(decoder_ctx_, video_stream->codecpar);
     
