@@ -82,7 +82,8 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
     if (avformat_open_input(&format_ctx_, path.c_str(), nullptr, nullptr) < 0) return false;
     if (avformat_find_stream_info(format_ctx_, nullptr) < 0) return false;
 
-    video_stream_index_ = av_find_best_stream(format_ctx_, AVMEDIA_TYPE_VIDEO, -1, -1, const_cast<const AVCodec**>(&decoder_), 0);
+    //                                                                              vvvvv--- FIX #1: Correct const_cast syntax
+    video_stream_index_ = av_find_best_stream(format_ctx_, AVMEDIA_TYPE_VIDEO, -1, -1, const_cast<AVCodec**>(&decoder_), 0);
     if (video_stream_index_ < 0) return false;
 
     AVStream* video_stream = format_ctx_->streams[video_stream_index_];
@@ -101,7 +102,8 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
                 return false;
             }
             if (av_bsf_alloc(bsf, &bsf_ctx_) < 0) return false;
-            if (avcodecpar_copy(bsf_ctx_->par_in, video_stream->codecpar) < 0) {
+            // FIX #2: Use correct function name 'avcodec_parameters_copy' vvvvvvvvvvvvvvvv
+            if (avcodec_parameters_copy(bsf_ctx_->par_in, video_stream->codecpar) < 0) {
                 av_bsf_free(&bsf_ctx_);
                 return false;
             }
