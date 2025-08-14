@@ -8,10 +8,13 @@
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+
 extern "C" {
 #include <libavutil/opt.h>
 }
+
 #pragma GCC diagnostic pop
+
 
 namespace hunter {
 namespace video_playback {
@@ -79,6 +82,15 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
     if (avformat_open_input(&format_ctx_, path.c_str(), nullptr, nullptr) < 0) return false;
     if (avformat_find_stream_info(format_ctx_, nullptr) < 0) return false;
 
+#if defined(USE_NVDEC)
+    // On Jetson, explicitly find the NVIDIA hardware decoder.
+    decoder_ = avcodec_find_decoder_by_name("h264_nvmpi");
+    if (!decoder_) {
+        std::cerr << "NVIDIA h264_nvmpi decoder not found. Falling back." << std::endl;
+    }
+#endif
+
+    // Find the best video stream and the corresponding decoder.
     video_stream_index_ = av_find_best_stream(format_ctx_, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder_, 0);
     if (video_stream_index_ < 0) return false;
 
@@ -92,7 +104,6 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
     
     decoder_ctx_->thread_count = std::max(1u, std::thread::hardware_concurrency());
     decoder_ctx_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
-    decoder_ctx_->flags |= AV_CODEC_FLAG_LOW_DELAY;
     
     if (avcodec_open2(decoder_ctx_, decoder_, nullptr) < 0) return false;
     
@@ -100,6 +111,7 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
     frame_duration_ = std::chrono::microseconds(static_cast<int64_t>(1000000.0 / fps));
 
     std::cout << "Decoder initialized successfully:" << std::endl;
+    std::cout << "  - Codec: " << decoder_->name << std::endl;
     std::cout << "  - Resolution: " << decoder_ctx_->width << "x" << decoder_ctx_->height << std::endl;
     std::cout << "  - Pacing at " << fps << " FPS" << std::endl;
     std::cout << "  - Hardware acceleration: " << (decoder_ctx_->hw_device_ctx ? "Enabled" : "Software") << std::endl;
