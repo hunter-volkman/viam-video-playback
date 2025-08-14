@@ -82,7 +82,6 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
     if (avformat_open_input(&format_ctx_, path.c_str(), nullptr, nullptr) < 0) return false;
     if (avformat_find_stream_info(format_ctx_, nullptr) < 0) return false;
 
-    //                                                                              vvvvv--- FIX #1: Correct const_cast syntax
     video_stream_index_ = av_find_best_stream(format_ctx_, AVMEDIA_TYPE_VIDEO, -1, -1, const_cast<AVCodec**>(&decoder_), 0);
     if (video_stream_index_ < 0) return false;
 
@@ -102,7 +101,6 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
                 return false;
             }
             if (av_bsf_alloc(bsf, &bsf_ctx_) < 0) return false;
-            // FIX #2: Use correct function name 'avcodec_parameters_copy' vvvvvvvvvvvvvvvv
             if (avcodec_parameters_copy(bsf_ctx_->par_in, video_stream->codecpar) < 0) {
                 av_bsf_free(&bsf_ctx_);
                 return false;
@@ -122,7 +120,7 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
     if (!decoder_ctx_) return false;
     avcodec_parameters_to_context(decoder_ctx_, video_stream->codecpar);
     
-    initialize_hw_decoder();
+    initialize_hw_decoder(decoder_ctx_->width, decoder_ctx_->height);
     
     decoder_ctx_->thread_count = std::max(1u, std::thread::hardware_concurrency());
     decoder_ctx_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
@@ -136,7 +134,7 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
     std::cout << "  - Codec: " << decoder_->name << std::endl;
     std::cout << "  - Resolution: " << decoder_ctx_->width << "x" << decoder_ctx_->height << std::endl;
     std::cout << "  - Pacing at " << fps << " FPS" << std::endl;
-    std::cout << "  - Hardware acceleration: " << (decoder_ctx_->hw_device_ctx ? "Enabled" : "Software") << std::endl;
+    std::cout << "  - Hardware acceleration: " << (decoder_ctx_->hw_frames_ctx ? "Enabled" : "Software") << std::endl;
 
     return true;
 }
@@ -213,6 +211,11 @@ void VideoPlaybackCamera::stop_pipeline() {
     if (bsf_ctx_) {
         av_bsf_free(&bsf_ctx_);
         bsf_ctx_ = nullptr;
+    }
+    
+    if (hw_frames_ctx_) {
+        av_buffer_unref(&hw_frames_ctx_);
+        hw_frames_ctx_ = nullptr;
     }
     
     cleanup_encoder_pool();
@@ -407,37 +410,50 @@ enum AVPixelFormat VideoPlaybackCamera::get_hw_format_videotoolbox(AVCodecContex
     }
     return AV_PIX_FMT_NONE;
 }
-#elif defined(USE_NVDEC)
-enum AVPixelFormat VideoPlaybackCamera::get_hw_format_nvdec(AVCodecContext* ctx, const enum AVPixelFormat* pix_fmts) {
-    for (const enum AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
-        if (*p == AV_PIX_FMT_CUDA) return *p;
-    }
-    std::cerr << "Failed to find CUDA pixel format." << std::endl;
-    return AV_PIX_FMT_NONE;
-}
 #endif
 
-bool VideoPlaybackCamera::initialize_hw_decoder() {
+bool VideoPlaybackCamera::initialize_hw_decoder(int width, int height) {
 #if defined(USE_VIDEOTOOLBOX)
+    // macOS path remains unchanged
     decoder_ctx_->get_format = &VideoPlaybackCamera::get_hw_format_videotoolbox;
     if (av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, nullptr, nullptr, 0) < 0) {
         std::cerr << "Warning: Failed to create VideoToolbox hardware device; using software decoding." << std::endl;
         return false;
     }
+    decoder_ctx_->hw_device_ctx = av_buffer_ref(hw_device_ctx_);
 #elif defined(USE_NVDEC)
-    decoder_ctx_->get_format = &VideoPlaybackCamera::get_hw_format_nvdec;
-    if (av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_CUDA, "default", nullptr, 0) < 0) {
-        std::cerr << "Warning: Failed to create CUDA hardware device; using software decoding." << std::endl;
+    // New, explicit hardware setup for NVIDIA
+    if (av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0) < 0) {
+        std::cerr << "Error: Failed to create CUDA hardware device." << std::endl;
+        return false;
+    }
+    
+    if (!(hw_frames_ctx_ = av_hwframe_ctx_alloc(hw_device_ctx_))) {
+        std::cerr << "Error: Failed to allocate hardware frame context." << std::endl;
+        return false;
+    }
+
+    AVHWFramesContext *frames_ctx = (AVHWFramesContext*)(hw_frames_ctx_->data);
+    frames_ctx->format = AV_PIX_FMT_CUDA;
+    frames_ctx->sw_format = AV_PIX_FMT_YUV420P; // The format after transfer to CPU
+    frames_ctx->width = width;
+    frames_ctx->height = height;
+    frames_ctx->initial_pool_size = 20;
+
+    if (av_hwframe_ctx_init(hw_frames_ctx_) < 0) {
+        std::cerr << "Error: Failed to initialize hardware frame context." << std::endl;
+        av_buffer_unref(&hw_frames_ctx_);
+        return false;
+    }
+    
+    // This is the crucial step: associate the frames context with the decoder context
+    decoder_ctx_->hw_frames_ctx = av_buffer_ref(hw_frames_ctx_);
+    if (!decoder_ctx_->hw_frames_ctx) {
+        std::cerr << "Error: Failed to set hardware frames context." << std::endl;
         return false;
     }
 #endif
-
-#if defined(USE_VIDEOTOOLBOX) || defined(USE_NVDEC)
-    decoder_ctx_->hw_device_ctx = av_buffer_ref(hw_device_ctx_);
     return true;
-#else
-    return false;
-#endif
 }
 
 bool VideoPlaybackCamera::transfer_hw_frame_to_sw(AVFrame* src, AVFrame* dst) {
