@@ -23,22 +23,23 @@ bool GstPipelineWrapper::start(const std::string& file_path, FrameCallback cb, b
     frame_cb_ = std::move(cb);
     loop_enabled_ = loop;
 
-    // Build optimized pipeline for Jetson hardware acceleration
-    // This pipeline uses NVIDIA's hardware decoders and JPEG encoder
+    // Build pipeline optimized for Jetson
+    // IMPORTANT: Using software jpegenc to avoid libjpeg ABI mismatch with nvjpegenc
+    // The hardware decoder (nvv4l2decoder) still provides acceleration
     std::stringstream pipeline_ss;
     pipeline_ss << "filesrc location=\"" << file_path << "\" ! ";
+    pipeline_ss << "qtdemux ! queue ! ";
+    pipeline_ss << "h264parse ! ";
     
-    // Use qtdemux for MP4/MOV files, adapt as needed for other containers
-    pipeline_ss << "qtdemux name=demux ! queue ! ";
+    // Use hardware decoder
+    pipeline_ss << "nvv4l2decoder enable-max-performance=1 ! ";
     
-    // Parse and decode H.264/H.265 using NVIDIA hardware
-    pipeline_ss << "h264parse ! nvv4l2decoder enable-max-performance=1 ! ";
+    // Convert to CPU memory with I420 format for jpegenc
+    // This avoids the libjpeg mismatch that nvjpegenc causes
+    pipeline_ss << "nvvidconv ! video/x-raw,format=I420 ! ";
     
-    // Convert to NVMM memory for efficient GPU processing
-    pipeline_ss << "nvvidconv ! video/x-raw(memory:NVMM),format=NV12 ! ";
-    
-    // Hardware JPEG encoding
-    pipeline_ss << "nvjpegenc quality=85 ! ";
+    // Software JPEG encoder - more stable and avoids ABI issues
+    pipeline_ss << "jpegenc quality=85 ! ";
     
     // Output to application
     pipeline_ss << "appsink name=mysink emit-signals=true "
@@ -96,7 +97,10 @@ bool GstPipelineWrapper::start(const std::string& file_path, FrameCallback cb, b
     running_.store(true);
     frames_processed_ = 0;
     
-    std::cout << "GStreamer pipeline started successfully" << std::endl;
+    std::cout << "✓ GStreamer pipeline started successfully" << std::endl;
+    std::cout << "  Using: nvv4l2decoder (hardware) → jpegenc (software)" << std::endl;
+    std::cout << "  This avoids libjpeg ABI mismatch issues" << std::endl;
+    
     return true;
 }
 
@@ -158,10 +162,21 @@ GstFlowReturn GstPipelineWrapper::on_new_sample(GstAppSink* sink, gpointer user_
 
     GstMapInfo info;
     if (gst_buffer_map(buf, &info, GST_MAP_READ)) {
+        // Log first few frames for debugging
+        if (self->frames_processed_ < 5) {
+            std::cout << "Frame " << (self->frames_processed_ + 1) 
+                      << " - JPEG size: " << info.size << " bytes" << std::endl;
+        }
+        
         // Deliver JPEG frame to callback
         try {
             self->frame_cb_(static_cast<const uint8_t*>(info.data), info.size);
             self->frames_processed_++;
+            
+            // Log progress periodically
+            if (self->frames_processed_ % 100 == 0) {
+                std::cout << "Processed " << self->frames_processed_ << " frames" << std::endl;
+            }
         } catch (const std::exception& ex) {
             std::cerr << "Frame callback threw exception: " << ex.what() << std::endl;
         }
@@ -177,11 +192,15 @@ gboolean GstPipelineWrapper::bus_callback(GstBus* bus, GstMessage* msg, gpointer
     
     switch (GST_MESSAGE_TYPE(msg)) {
         case GST_MESSAGE_EOS:
-            std::cout << "GStreamer: End of stream reached" << std::endl;
+            std::cout << "End of stream reached" << std::endl;
             if (self->loop_enabled_ && self->running_.load()) {
                 // Seek back to beginning for loop
-                gst_element_seek_simple(self->pipeline_, GST_FORMAT_TIME,
-                    static_cast<GstSeekFlags>(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT), 0);
+                if (!gst_element_seek_simple(self->pipeline_, GST_FORMAT_TIME,
+                    static_cast<GstSeekFlags>(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT), 0)) {
+                    std::cerr << "Failed to seek to beginning for loop" << std::endl;
+                } else {
+                    std::cout << "Looped back to beginning" << std::endl;
+                }
             }
             break;
             
@@ -190,9 +209,11 @@ gboolean GstPipelineWrapper::bus_callback(GstBus* bus, GstMessage* msg, gpointer
             gchar* debug_info;
             gst_message_parse_error(msg, &err, &debug_info);
             std::cerr << "GStreamer error: " << err->message << std::endl;
-            std::cerr << "Debug info: " << (debug_info ? debug_info : "none") << std::endl;
+            if (debug_info) {
+                std::cerr << "Debug info: " << debug_info << std::endl;
+                g_free(debug_info);
+            }
             g_clear_error(&err);
-            g_free(debug_info);
             break;
         }
         
@@ -201,8 +222,10 @@ gboolean GstPipelineWrapper::bus_callback(GstBus* bus, GstMessage* msg, gpointer
             gchar* debug_info;
             gst_message_parse_warning(msg, &err, &debug_info);
             std::cerr << "GStreamer warning: " << err->message << std::endl;
+            if (debug_info) {
+                g_free(debug_info);
+            }
             g_clear_error(&err);
-            g_free(debug_info);
             break;
         }
         
