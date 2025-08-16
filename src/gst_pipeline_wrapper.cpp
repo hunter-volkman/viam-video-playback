@@ -78,6 +78,24 @@ bool GstPipelineWrapper::start(const std::string& file_path, FrameCallback cb, b
     GstStateChangeReturn sret = gst_element_set_state(pipeline_, GST_STATE_PLAYING);
     if (sret == GST_STATE_CHANGE_FAILURE) {
         std::cerr << "Failed to set pipeline to PLAYING state" << std::endl;
+        
+        // Get detailed error from bus
+        GstBus* bus = gst_element_get_bus(pipeline_);
+        GstMessage* msg = gst_bus_pop_filtered(bus, GST_MESSAGE_ERROR);
+        if (msg) {
+            GError* err;
+            gchar* debug_info;
+            gst_message_parse_error(msg, &err, &debug_info);
+            std::cerr << "GStreamer Error: " << err->message << std::endl;
+            if (debug_info) {
+                std::cerr << "Debug Info: " << debug_info << std::endl;
+                g_free(debug_info);
+            }
+            g_clear_error(&err);
+            gst_message_unref(msg);
+        }
+        gst_object_unref(bus);
+        
         cleanup_pipeline();
         return false;
     }
