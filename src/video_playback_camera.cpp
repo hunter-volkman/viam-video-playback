@@ -5,6 +5,8 @@
 #include <iostream>
 #include <vector>
 #include <string>
+#include <functional>
+#include <memory>
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
@@ -15,6 +17,10 @@ extern "C" {
 
 #pragma GCC diagnostic pop
 
+// Include the GST wrapper (only on Jetson fast path)
+#if defined(USE_NVDEC)
+#include "gst_pipeline_wrapper.hpp"
+#endif
 
 namespace hunter {
 namespace video_playback {
@@ -67,6 +73,41 @@ void VideoPlaybackCamera::reconfigure(const vs::Dependencies& deps, const vs::Re
     std::cout << "  - Target FPS: " << (target_fps_ > 0 ? std::to_string(target_fps_) : "source") << std::endl;
     std::cout << "  - JPEG Quality Level: " << quality_level_ << std::endl;
 
+    // Attempt to start GStreamer accelerated path (Jetson) if enabled at build time.
+    // If this succeeds, we return early and do not initialize the FFmpeg decoder.
+#if defined(USE_NVDEC)
+    try {
+        if (!gst_pipeline_) gst_pipeline_ = std::make_unique<GstPipelineWrapper>();
+
+        auto cb = [this](const uint8_t* data, size_t size) {
+            {
+                std::lock_guard<std::mutex> lock(this->jpeg_mutex_);
+                this->latest_jpeg_buffer_.assign(data, data + size);
+                this->is_jpeg_ready_ = true;
+            }
+            this->jpeg_ready_cv_.notify_one();
+
+            // nvjpegenc already produced a JPEG; we count both decode+encode here
+            this->frames_decoded_.fetch_add(1);
+            this->frames_encoded_.fetch_add(1);
+        };
+
+        if (gst_pipeline_->start(video_path_, cb, loop_playback_)) {
+            std::cout << "Started GStreamer Jetson fast-path pipeline (nv* elements)." << std::endl;
+            // Keep the module lifecycle consistent (stats, get_image timing, etc.)
+            start_pipeline(); // sets is_running_ and start_time_; no FFmpeg threads are started for GST path
+            return;
+        } else {
+            std::cerr << "GStreamer pipeline failed to start; falling back to FFmpeg path." << std::endl;
+            gst_pipeline_.reset();
+        }
+    } catch (const std::exception& ex) {
+        std::cerr << "Exception while starting GStreamer pipeline: " << ex.what() << ". Falling back to FFmpeg path." << std::endl;
+        gst_pipeline_.reset();
+    }
+#endif
+
+    // If we get here, either USE_NVDEC was not defined or GStreamer start failed; proceed with FFmpeg init.
     if (!initialize_decoder(video_path_)) {
         throw vs::Exception("Failed to initialize video decoder for: " + video_path_);
     }
@@ -146,8 +187,7 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
         }
     }
 
-    // This is our robust fallback logic. If opening the chosen decoder fails
-    // (e.g., NvMMLite error), we will explicitly switch to the basic software decoder.
+    // Robust fallback: if opening chosen decoder fails, fall back to software.
     if (avcodec_open2(decoder_ctx_, decoder_, nullptr) < 0) {
         std::cerr << "Error: Failed to open initial codec '" << decoder_->name << "'. Forcing software fallback." << std::endl;
         avcodec_free_context(&decoder_ctx_);
@@ -158,7 +198,6 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
             return false;
         }
         decoder_ = sw_decoder;
-        is_hw_decoder = false; // We are no longer using a hardware decoder
 
         decoder_ctx_ = avcodec_alloc_context3(decoder_);
         avcodec_parameters_to_context(decoder_ctx_, video_stream->codecpar);
@@ -169,7 +208,7 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
         }
     }
     
-    // Always initialize the bitstream filter for h264 in mp4
+    // Bitstream filter for h264-in-mp4
     if (video_stream->codecpar->codec_id == AV_CODEC_ID_H264) {
         const AVBitStreamFilter* bsf = av_bsf_get_by_name("h264_mp4toannexb");
         if (bsf) {
@@ -251,13 +290,36 @@ void VideoPlaybackCamera::start_pipeline() {
     is_running_ = true;
     start_time_ = std::chrono::high_resolution_clock::now();
     
+    // Only start threads for FFmpeg path. If GStreamer fast-path is active, we keep the object running
+    // to maintain statistics and allow get_image() to operate on the JPEG buffer updated by appsink callback.
+#if defined(USE_NVDEC)
+    if (!(/* gst path active? */ gst_pipeline_ && gst_pipeline_->running())) {
+        producer_thread_ = std::thread(&VideoPlaybackCamera::producer_thread_func, this);
+        for (int i = 0; i < num_encoder_threads_; ++i) {
+            encoder_threads_.emplace_back(&VideoPlaybackCamera::consumer_thread_func, this, i);
+        }
+    }
+#else
     producer_thread_ = std::thread(&VideoPlaybackCamera::producer_thread_func, this);
     for (int i = 0; i < num_encoder_threads_; ++i) {
         encoder_threads_.emplace_back(&VideoPlaybackCamera::consumer_thread_func, this, i);
     }
+#endif
 }
 
 void VideoPlaybackCamera::stop_pipeline() {
+#if defined(USE_NVDEC)
+    // Stop gst pipeline first (if present)
+    if (gst_pipeline_) {
+        try {
+            gst_pipeline_->stop();
+        } catch (...) {
+            // swallow - we don't want destructor exceptions
+        }
+        gst_pipeline_.reset();
+    }
+#endif
+
     if (!is_running_) return;
     is_running_ = false;
     

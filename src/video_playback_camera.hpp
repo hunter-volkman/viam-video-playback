@@ -12,6 +12,11 @@
 #include <vector>
 #include <queue>
 
+// Forward declare GstPipelineWrapper only when we actually use it (Jetson fast path)
+#if defined(USE_NVDEC)
+class GstPipelineWrapper;
+#endif
+
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -108,6 +113,11 @@ private:
     
     double source_fps_{30.0};
     std::chrono::microseconds frame_duration_;
+
+#if defined(USE_NVDEC)
+    // GStreamer pipeline wrapper (optional fast path on Jetson)
+    std::unique_ptr<GstPipelineWrapper> gst_pipeline_;
+#endif
 };
 
 } // namespace video_playback
