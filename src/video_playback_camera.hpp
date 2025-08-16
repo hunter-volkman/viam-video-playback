@@ -101,6 +101,7 @@ private:
     std::vector<uint8_t> latest_jpeg_buffer_;
     bool is_jpeg_ready_{false};
     std::condition_variable jpeg_ready_cv_;
+    std::chrono::steady_clock::time_point last_frame_time_;  // Track when last frame was received
     
     std::atomic<bool> is_running_{false};
     std::thread producer_thread_;

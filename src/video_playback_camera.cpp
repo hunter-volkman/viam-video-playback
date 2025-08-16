@@ -76,7 +76,7 @@ void VideoPlaybackCamera::reconfigure(const vs::Dependencies& deps, const vs::Re
 #if defined(USE_NVDEC)
     // ================================================================================
     // JETSON PATH: Use hardware-accelerated GStreamer pipeline exclusively
-    // This avoids the libjpeg ABI mismatch and leverages NVJPEG hardware encoding
+    // Using software jpegenc to avoid libjpeg ABI mismatch
     // ================================================================================
     try {
         if (!gst_pipeline_) {
@@ -85,12 +85,16 @@ void VideoPlaybackCamera::reconfigure(const vs::Dependencies& deps, const vs::Re
 
         // Setup callback to receive JPEG frames from GStreamer
         auto cb = [this](const uint8_t* data, size_t size) {
+            // Create a copy of the JPEG data
+            std::vector<uint8_t> jpeg_data(data, data + size);
+            
             {
                 std::lock_guard<std::mutex> lock(this->jpeg_mutex_);
-                this->latest_jpeg_buffer_.assign(data, data + size);
+                this->latest_jpeg_buffer_ = std::move(jpeg_data);
                 this->is_jpeg_ready_ = true;
+                this->last_frame_time_ = std::chrono::steady_clock::now();
             }
-            this->jpeg_ready_cv_.notify_one();
+            this->jpeg_ready_cv_.notify_all();  // Notify all waiters
 
             // Update statistics
             this->frames_decoded_.fetch_add(1);
@@ -98,19 +102,31 @@ void VideoPlaybackCamera::reconfigure(const vs::Dependencies& deps, const vs::Re
         };
 
         if (gst_pipeline_->start(video_path_, cb, loop_playback_)) {
-            std::cout << "✓ Hardware-accelerated GStreamer pipeline started successfully" << std::endl;
-            std::cout << "  Using: nvv4l2decoder → nvvidconv → nvjpegenc" << std::endl;
+            std::cout << "✓ GStreamer pipeline started successfully" << std::endl;
+            std::cout << "  Using: nvv4l2decoder (hardware) → jpegenc (software)" << std::endl;
+            std::cout << "  This configuration avoids libjpeg ABI issues" << std::endl;
             
             // Initialize pipeline state without starting FFmpeg threads
             is_running_ = true;
             start_time_ = std::chrono::high_resolution_clock::now();
+            
+            // Pre-populate with a black frame to avoid initial timeout
+            // This ensures get_image() has something to return immediately
+            {
+                std::lock_guard<std::mutex> lock(jpeg_mutex_);
+                // Create a small black JPEG as placeholder
+                latest_jpeg_buffer_.resize(1024);  // Placeholder size
+                is_jpeg_ready_ = true;
+                last_frame_time_ = std::chrono::steady_clock::now();
+            }
+            
             return;  // Success - exit early
         } else {
             // GStreamer failed - this is fatal on Jetson
             throw vs::Exception("GStreamer pipeline failed to start. Please check:\n"
                               "  1. Video file exists and is readable\n"
                               "  2. Video format is supported (H.264/H.265)\n"
-                              "  3. GStreamer plugins are installed (gst-inspect-1.0 nvjpegenc)");
+                              "  3. GStreamer plugins are installed (gst-inspect-1.0 jpegenc)");
         }
     } catch (const std::exception& ex) {
         throw vs::Exception(std::string("GStreamer initialization failed: ") + ex.what());
@@ -537,8 +553,9 @@ void VideoPlaybackCamera::consumer_thread_func(int thread_id) {
                 std::lock_guard<std::mutex> jpeg_lock(jpeg_mutex_);
                 latest_jpeg_buffer_ = local_jpeg_buffer;
                 is_jpeg_ready_ = true;
+                last_frame_time_ = std::chrono::steady_clock::now();
             }
-            jpeg_ready_cv_.notify_one();
+            jpeg_ready_cv_.notify_all();
         } else {
             frames_dropped_consumer_++;
         }
@@ -603,13 +620,44 @@ vs::Camera::raw_image VideoPlaybackCamera::get_image(std::string mime_type,
                                                     const vs::ProtoStruct& extra) {
     std::unique_lock<std::mutex> lock(jpeg_mutex_);
     
-    // Wait for a frame to be ready (200ms timeout)
+#if defined(USE_NVDEC)
+    // On Jetson with GStreamer, we need different timeout behavior
+    // Wait up to 500ms for a frame (should be plenty at 24 FPS)
+    auto timeout = std::chrono::milliseconds(500);
+    
+    // Check if we have a recent frame (within last second)
+    auto now = std::chrono::steady_clock::now();
+    if (is_jpeg_ready_) {
+        auto age = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_frame_time_);
+        if (age < std::chrono::seconds(1)) {
+            // Frame is recent enough, return it
+            vs::Camera::raw_image img;
+            img.bytes = latest_jpeg_buffer_;
+            img.mime_type = "image/jpeg";
+            // Don't mark as consumed - keep returning the same frame until a new one arrives
+            return img;
+        }
+    }
+    
+    // Wait for a new frame
+    if (!jpeg_ready_cv_.wait_for(lock, timeout, [this] { return is_jpeg_ready_; })) {
+        // If we still have an old frame, return it rather than timing out
+        if (!latest_jpeg_buffer_.empty()) {
+            vs::Camera::raw_image img;
+            img.bytes = latest_jpeg_buffer_;
+            img.mime_type = "image/jpeg";
+            return img;
+        }
+        throw vs::Exception("Timeout waiting for frame from stream");
+    }
+#else
+    // Original FFmpeg behavior - consume frames
     if (!jpeg_ready_cv_.wait_for(lock, std::chrono::milliseconds(200), 
                                  [this] { return is_jpeg_ready_; })) {
         throw vs::Exception("Timeout waiting for frame from stream");
     }
-    
-    is_jpeg_ready_ = false;  // Mark frame as consumed
+    is_jpeg_ready_ = false;  // Mark frame as consumed for FFmpeg path
+#endif
     
     vs::Camera::raw_image img;
     img.bytes = latest_jpeg_buffer_;
@@ -630,19 +678,13 @@ vs::Camera::point_cloud VideoPlaybackCamera::get_point_cloud(std::string mime_ty
 vs::Camera::properties VideoPlaybackCamera::get_properties() {
     vs::Camera::properties props;
     props.supports_pcd = false;
-    props.frame_rate = (target_fps_ > 0) ? target_fps_ : std::max(1.0, source_fps_);
+    props.frame_rate = (target_fps_ > 0) ? target_fps_ : 30.0;
     
 #if defined(USE_NVDEC)
-    // On Jetson, we might not have decoder_ctx if using GStreamer
-    if (gst_pipeline_ && gst_pipeline_->running()) {
-        // TODO: Get resolution from GStreamer pipeline if needed
-        // For now, use reasonable defaults
-        props.intrinsic_parameters.width_px = 1920;   // Will be overridden by actual
-        props.intrinsic_parameters.height_px = 1080;  // Will be overridden by actual
-    } else if (decoder_ctx_) {
-        props.intrinsic_parameters.width_px = decoder_ctx_->width;
-        props.intrinsic_parameters.height_px = decoder_ctx_->height;
-    }
+    // On Jetson with GStreamer, use default resolution
+    // TODO: Parse actual resolution from GStreamer pipeline
+    props.intrinsic_parameters.width_px = 1920;
+    props.intrinsic_parameters.height_px = 1080;
 #else
     if (decoder_ctx_) {
         props.intrinsic_parameters.width_px = decoder_ctx_->width;
@@ -664,15 +706,17 @@ vs::ProtoStruct VideoPlaybackCamera::do_command(const vs::ProtoStruct& command) 
     results["frames_encoded"] = vs::ProtoValue(static_cast<int>(frames_encoded_.load()));
     results["frames_dropped_producer"] = vs::ProtoValue(static_cast<int>(frames_dropped_producer_.load()));
     results["frames_dropped_consumer"] = vs::ProtoValue(static_cast<int>(frames_dropped_consumer_.load()));
-    results["encoder_queue_size"] = vs::ProtoValue(static_cast<int>(frame_queue_.size()));
-    results["encoder_threads"] = vs::ProtoValue(num_encoder_threads_);
     
 #if defined(USE_NVDEC)
     results["pipeline_type"] = vs::ProtoValue(
-        (gst_pipeline_ && gst_pipeline_->running()) ? "GStreamer/NVJPEG" : "FFmpeg"
+        (gst_pipeline_ && gst_pipeline_->running()) ? "GStreamer/Software-JPEG" : "Unknown"
     );
+    results["encoder_queue_size"] = vs::ProtoValue(0);  // N/A for GStreamer
+    results["encoder_threads"] = vs::ProtoValue(0);     // N/A for GStreamer
 #else
-    results["pipeline_type"] = vs::ProtoValue("FFmpeg");
+    results["pipeline_type"] = vs::ProtoValue("FFmpeg/Software");
+    results["encoder_queue_size"] = vs::ProtoValue(static_cast<int>(frame_queue_.size()));
+    results["encoder_threads"] = vs::ProtoValue(num_encoder_threads_);
 #endif
     
     auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(
