@@ -4,6 +4,8 @@
 #include <functional>
 #include <atomic>
 #include <cstdint>
+#include <thread>
+#include <chrono>
 
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
@@ -12,9 +14,10 @@
  * GStreamer Pipeline Wrapper for Hardware-Accelerated Video Playback
  * 
  * This wrapper manages a GStreamer pipeline optimized for NVIDIA Jetson platforms,
- * using hardware decoders (nvv4l2decoder) and hardware JPEG encoding (nvjpegenc).
+ * using hardware decoders (nvv4l2decoder) with software JPEG encoding (jpegenc)
+ * to avoid libjpeg ABI mismatch issues.
  * 
- * Pipeline: filesrc → qtdemux → h264parse → nvv4l2decoder → nvvidconv → nvjpegenc → appsink
+ * Pipeline: filesrc → qtdemux → h264parse → nvv4l2decoder → nvvidconv → jpegenc → appsink
  */
 class GstPipelineWrapper {
 public:
@@ -60,6 +63,12 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<uint64_t> frames_processed_{0};
     bool loop_enabled_ = true;
+    std::string file_path_;  // Store for restart
+    guint bus_watch_id_ = 0;  // Bus watch ID for cleanup
+
+    // Internal methods
+    void cleanup_pipeline();
+    bool restart_pipeline();
 
     // GStreamer callbacks
     static GstFlowReturn on_new_sample(GstAppSink* sink, gpointer user_data);
