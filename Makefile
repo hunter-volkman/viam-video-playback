@@ -37,8 +37,9 @@ endif
 # Create the distributable .tar.gz archive
 dist: build
 	mkdir -p $(INSTALL_DIR)/bin
-	cp $(BUILD_DIR)/$(MODULE_NAME) $(INSTALL_DIR)/bin/
+	cp $(BUILD_DIR)/$(MODULE_NAME) $(INSTALL_DIR)/bin/ || cp $(BUILD_DIR)/$(MODULE_NAME) $(INSTALL_DIR)/bin/
 	cp run.sh $(INSTALL_DIR)/
+	cp meta.json $(INSTALL_DIR)/ 
 	cd $(INSTALL_DIR) && tar -czvf ../../$(ARCHIVE_NAME) .
 	@echo "Created distribution package: $(ARCHIVE_NAME)"
 
