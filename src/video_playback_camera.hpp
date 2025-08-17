@@ -85,6 +85,12 @@ private:
     bool loop_playback_ = true;
     int target_fps_ = 0;
     int quality_level_ = 15;
+    int max_resolution_ = 0;  // New: max resolution for downscaling
+    bool use_hardware_accel_ = false;  // New: hardware acceleration flag
+    
+    // Output dimensions (may differ from source)
+    int output_width_ = 0;
+    int output_height_ = 0;
     
     // Decoder state
     AVFormatContext* format_ctx_ = nullptr;

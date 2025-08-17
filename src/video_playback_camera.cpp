@@ -11,6 +11,7 @@
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 extern "C" {
 #include <libavutil/opt.h>
+#include <libavutil/hwcontext.h>
 }
 #pragma GCC diagnostic pop
 
@@ -39,6 +40,10 @@ VideoPlaybackCamera::VideoPlaybackCamera(
     std::cout << "Initializing VideoPlaybackCamera: " << cfg.name() << std::endl;
     std::cout << "Hardware threads: " << std::thread::hardware_concurrency() 
               << ", using " << num_encoder_threads_ << " encoder threads" << std::endl;
+    
+#ifdef USE_NVDEC
+    std::cout << "NVIDIA hardware acceleration support enabled" << std::endl;
+#endif
     
     reconfigure(deps, cfg);
 }
@@ -75,19 +80,51 @@ void VideoPlaybackCamera::reconfigure(
             2, 31);
     }
     
+    // New: max_resolution for downscaling
+    if (attrs.find("max_resolution") != attrs.end()) {
+        max_resolution_ = static_cast<int>(*attrs.at("max_resolution").get<double>());
+    }
+    
+    // New: hardware acceleration toggle
+    if (attrs.find("use_hardware_accel") != attrs.end()) {
+        use_hardware_accel_ = *attrs.at("use_hardware_accel").get<bool>();
+    }
+    
     std::cout << "Configuration:" << std::endl;
     std::cout << "  Path: " << video_path_ << std::endl;
     std::cout << "  Loop: " << (loop_playback_ ? "yes" : "no") << std::endl;
     std::cout << "  Target FPS: " << (target_fps_ > 0 ? std::to_string(target_fps_) : "source") << std::endl;
     std::cout << "  JPEG Quality: " << quality_level_ << std::endl;
+    std::cout << "  Max Resolution: " << (max_resolution_ > 0 ? std::to_string(max_resolution_) : "source") << std::endl;
+    std::cout << "  Hardware Accel: " << (use_hardware_accel_ ? "yes" : "no") << std::endl;
     
     // Initialize decoder
     if (!initialize_decoder(video_path_)) {
         throw vs::Exception("Failed to initialize video decoder for: " + video_path_);
     }
     
+    // Calculate output dimensions
+    output_width_ = decoder_ctx_->width;
+    output_height_ = decoder_ctx_->height;
+    
+    if (max_resolution_ > 0 && (output_width_ > max_resolution_ || output_height_ > max_resolution_)) {
+        // Scale down maintaining aspect ratio
+        if (output_width_ > output_height_) {
+            output_width_ = max_resolution_;
+            output_height_ = (decoder_ctx_->height * max_resolution_) / decoder_ctx_->width;
+        } else {
+            output_height_ = max_resolution_;
+            output_width_ = (decoder_ctx_->width * max_resolution_) / decoder_ctx_->height;
+        }
+        // Ensure even dimensions for encoding
+        output_width_ = (output_width_ / 2) * 2;
+        output_height_ = (output_height_ / 2) * 2;
+        
+        std::cout << "  Output scaled to: " << output_width_ << "x" << output_height_ << std::endl;
+    }
+    
     // Initialize encoder pool
-    if (!initialize_encoder_pool(decoder_ctx_->width, decoder_ctx_->height)) {
+    if (!initialize_encoder_pool(output_width_, output_height_)) {
         throw vs::Exception("Failed to initialize JPEG encoder pool.");
     }
     
@@ -126,11 +163,32 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
     AVStream* video_stream = format_ctx_->streams[video_stream_index_];
     source_fps_ = av_q2d(video_stream->r_frame_rate);
     
-    // Find decoder
-    decoder_ = avcodec_find_decoder(video_stream->codecpar->codec_id);
+    // Try to use hardware decoder on Jetson
+#ifdef USE_NVDEC
+    if (use_hardware_accel_) {
+        // Try NVIDIA V4L2 decoder first
+        if (video_stream->codecpar->codec_id == AV_CODEC_ID_H264) {
+            decoder_ = avcodec_find_decoder_by_name("h264_v4l2m2m");
+            if (decoder_) {
+                std::cout << "Using NVIDIA V4L2 H.264 hardware decoder" << std::endl;
+            }
+        } else if (video_stream->codecpar->codec_id == AV_CODEC_ID_HEVC) {
+            decoder_ = avcodec_find_decoder_by_name("hevc_v4l2m2m");
+            if (decoder_) {
+                std::cout << "Using NVIDIA V4L2 HEVC hardware decoder" << std::endl;
+            }
+        }
+    }
+#endif
+    
+    // Fall back to software decoder
     if (!decoder_) {
-        std::cerr << "Error: Codec not found" << std::endl;
-        return false;
+        decoder_ = avcodec_find_decoder(video_stream->codecpar->codec_id);
+        if (!decoder_) {
+            std::cerr << "Error: Codec not found" << std::endl;
+            return false;
+        }
+        std::cout << "Using software decoder: " << decoder_->name << std::endl;
     }
     
     // Allocate decoder context
@@ -143,9 +201,11 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
     // Copy codec parameters
     avcodec_parameters_to_context(decoder_ctx_, video_stream->codecpar);
     
-    // Use multiple threads for decoding
-    decoder_ctx_->thread_count = num_encoder_threads_;
-    decoder_ctx_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+    // Use multiple threads for decoding (software decoder)
+    if (strstr(decoder_->name, "v4l2") == nullptr) {
+        decoder_ctx_->thread_count = num_encoder_threads_;
+        decoder_ctx_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+    }
     
     // Open decoder
     if (avcodec_open2(decoder_ctx_, decoder_, nullptr) < 0) {
@@ -174,7 +234,15 @@ bool VideoPlaybackCamera::initialize_encoder_pool(int width, int height) {
     std::cout << "Initializing MJPEG encoder pool (" 
               << width << "x" << height << ")" << std::endl;
     
-    const AVCodec* mjpeg_encoder = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
+    const AVCodec* mjpeg_encoder = nullptr;
+    
+#ifdef USE_NVDEC
+    // On Jetson, try to use hardware MJPEG encoder
+    // Note: Jetson doesn't have hardware MJPEG, so we still use software
+    // but we could potentially use NVJPEG library in the future
+#endif
+    
+    mjpeg_encoder = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
     if (!mjpeg_encoder) {
         std::cerr << "Error: MJPEG encoder not found" << std::endl;
         return false;
@@ -194,9 +262,15 @@ bool VideoPlaybackCamera::initialize_encoder_pool(int width, int height) {
         ctx->height = height;
         ctx->time_base = AVRational{1, static_cast<int>(source_fps_)};
         
-        // Set quality
+        // Set quality - use lower quality for higher resolutions
+        int adjusted_quality = quality_level_;
+        if (width > 2560 || height > 1440) {
+            // For 4K, increase quality value (lower quality) for better performance
+            adjusted_quality = std::min(31, quality_level_ + 5);
+        }
+        
         AVDictionary* opts = nullptr;
-        av_dict_set(&opts, "qscale", std::to_string(quality_level_).c_str(), 0);
+        av_dict_set(&opts, "qscale", std::to_string(adjusted_quality).c_str(), 0);
         
         if (avcodec_open2(ctx, mjpeg_encoder, &opts) < 0) {
             av_dict_free(&opts);
@@ -216,10 +290,13 @@ bool VideoPlaybackCamera::initialize_encoder_pool(int width, int height) {
             return false;
         }
         
-        // Create scaler if needed
-        if (decoder_ctx_->pix_fmt != AV_PIX_FMT_YUVJ420P) {
+        // Create scaler - handles both color conversion and scaling
+        bool needs_scaling = (width != decoder_ctx_->width || height != decoder_ctx_->height);
+        bool needs_conversion = (decoder_ctx_->pix_fmt != AV_PIX_FMT_YUVJ420P);
+        
+        if (needs_scaling || needs_conversion) {
             sws_contexts_[i] = sws_getContext(
-                width, height, decoder_ctx_->pix_fmt,
+                decoder_ctx_->width, decoder_ctx_->height, decoder_ctx_->pix_fmt,
                 width, height, AV_PIX_FMT_YUVJ420P,
                 SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
             
@@ -461,7 +538,7 @@ bool VideoPlaybackCamera::encode_task(
     
     AVFrame* dst_yuv = yuv_frames_[thread_id];
     
-    // Convert color space if needed
+    // Convert color space and/or scale if needed
     if (sws_contexts_[thread_id]) {
         sws_scale(sws_contexts_[thread_id],
                  task.frame->data, task.frame->linesize,
@@ -512,10 +589,9 @@ vs::Camera::properties VideoPlaybackCamera::get_properties() {
     props.supports_pcd = false;
     props.frame_rate = (target_fps_ > 0) ? target_fps_ : source_fps_;
     
-    if (decoder_ctx_) {
-        props.intrinsic_parameters.width_px = decoder_ctx_->width;
-        props.intrinsic_parameters.height_px = decoder_ctx_->height;
-    }
+    // Report output dimensions, not source dimensions
+    props.intrinsic_parameters.width_px = output_width_;
+    props.intrinsic_parameters.height_px = output_height_;
     
     return props;
 }
@@ -543,6 +619,9 @@ vs::ProtoStruct VideoPlaybackCamera::do_command(const vs::ProtoStruct& command) 
             elapsed > 0 ? static_cast<double>(frames_encoded_.load()) / elapsed : 0.0);
         stats["encoder_queue_size"] = vs::ProtoValue(static_cast<int>(frame_queue_.size()));
         stats["encoder_threads"] = vs::ProtoValue(num_encoder_threads_);
+        stats["output_width"] = vs::ProtoValue(output_width_);
+        stats["output_height"] = vs::ProtoValue(output_height_);
+        stats["hardware_accel"] = vs::ProtoValue(use_hardware_accel_);
         
         return stats;
     }
