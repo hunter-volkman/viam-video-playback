@@ -15,7 +15,7 @@
  * GStreamer Pipeline Wrapper for Hardware-Accelerated Video Playback (Jetson)
  *
  * Decode-only pipeline (NO in-process JPEG encoding):
- *   filesrc → qtdemux → queue → h264parse → nvv4l2decoder → nvvidconv → video/x-raw,format=I420 → appsink
+ *   filesrc → qtdemux → queue → h264parse → nvv4l2decoder → nvvidconv → video/x-raw,format=I420[,width=...,height=...] → appsink
  *
  * Looping Strategy:
  *   1) Try post-EOS seek (pause → seek-to-0 (flush|key-unit) → play)
@@ -23,8 +23,8 @@
  */
 class GstPipelineWrapper {
 public:
-    // I420 raw frame callback: data is a single contiguous I420 buffer (Y plane, U plane, V plane)
-    // with tight packing (stride == width). size == width*height + (width/2)*(height/2)*2.
+    // I420 raw frame callback: data is a single contiguous I420 buffer (Y plane, U, V),
+    // tight packing (Y stride == width; U/V stride == width/2). size == w*h + 2*(w/2*h/2).
     using FrameCallback = std::function<void(const uint8_t* data, size_t size, int width, int height)>;
 
     GstPipelineWrapper();
@@ -37,13 +37,19 @@ public:
     /**
      * Start the GStreamer pipeline for a video file (decode-only).
      * @param file_path Path to the video file
-     * @param cb Callback function to receive I420 frames (contiguous, tight stride)
+     * @param cb Callback for I420 frames
      * @param loop Enable looping playback
-     * @param max_buffers Maximum buffers in appsink queue
+     * @param max_buffers appsink queue depth (dropped when full)
+     * @param desired_w If >0, scale to this width at nvvidconv caps
+     * @param desired_h If >0, scale to this height at nvvidconv caps
      * @return true if pipeline started successfully
      */
-    bool start(const std::string& file_path, FrameCallback cb,
-               bool loop = true, int max_buffers = 8);
+    bool start(const std::string& file_path,
+               FrameCallback cb,
+               bool loop = true,
+               int max_buffers = 8,
+               int desired_w = 0,
+               int desired_h = 0);
 
     /** Stop the pipeline gracefully (blocking teardown). */
     void stop();
@@ -73,6 +79,10 @@ private:
     int                   width_  = 0;
     int                   height_ = 0;
 
+    // Requested scaler caps
+    int                   desired_w_ = 0;
+    int                   desired_h_ = 0;
+
     // Lock to serialize start/stop/restart operations
     std::mutex            lifecycle_mtx_;
 
@@ -80,7 +90,10 @@ private:
     bool build_and_start_pipeline(int max_buffers, std::string* err_out);
     void cleanup_pipeline();     // blocking NULL + unref + remove bus watch
     bool restart_pipeline();     // safe blocking restart
-    static std::string make_pipeline_str(const std::string& file_path, int max_buffers);
+    static std::string make_pipeline_str(const std::string& file_path,
+                                         int max_buffers,
+                                         int desired_w,
+                                         int desired_h);
 
     // GStreamer callbacks
     static GstFlowReturn on_new_sample(GstAppSink* sink, gpointer user_data);

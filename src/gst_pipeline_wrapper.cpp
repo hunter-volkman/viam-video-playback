@@ -5,7 +5,6 @@
 #include <cstring>
 
 GstPipelineWrapper::GstPipelineWrapper() {
-    // Safe to call multiple times; GStreamer ignores redundant init
     gst_init(nullptr, nullptr);
     std::cout << "GStreamer initialized (decode-only pipeline)." << std::endl;
 }
@@ -14,23 +13,28 @@ GstPipelineWrapper::~GstPipelineWrapper() {
     stop();
 }
 
-std::string GstPipelineWrapper::make_pipeline_str(const std::string& file_path, int max_buffers) {
-    // Decode-only pipeline with tight I420 output. We request tight packing (default for nvvidconv I420).
+std::string GstPipelineWrapper::make_pipeline_str(const std::string& file_path,
+                                                  int max_buffers,
+                                                  int desired_w,
+                                                  int desired_h) {
+    // Decode-only pipeline; optionally scale at nvvidconv
     std::stringstream ss;
     ss << "filesrc location=\"" << file_path << "\" ! ";
     ss << "qtdemux name=demux ";
     ss << "demux.video_0 ! queue max-size-buffers=0 max-size-bytes=0 max-size-time=0 ! ";
     ss << "h264parse config-interval=-1 ! ";
     ss << "nvv4l2decoder enable-max-performance=1 ! ";
-    ss << "nvvidconv ! video/x-raw,format=I420 ! ";
-    ss << "appsink name=mysink emit-signals=true ";
+    ss << "nvvidconv ! video/x-raw,format=I420";
+    if (desired_w > 0 && desired_h > 0) {
+        ss << ",width=" << desired_w << ",height=" << desired_h;
+    }
+    ss << " ! appsink name=mysink emit-signals=true ";
     ss << "max-buffers=" << max_buffers << " drop=true sync=false";
     return ss.str();
 }
 
 bool GstPipelineWrapper::build_and_start_pipeline(int max_buffers, std::string* err_out) {
-    // Build pipeline
-    std::string pipeline_str = make_pipeline_str(file_path_, max_buffers);
+    std::string pipeline_str = make_pipeline_str(file_path_, max_buffers, desired_w_, desired_h_);
     std::cout << "Creating GStreamer pipeline: " << pipeline_str << std::endl;
 
     GError* err = nullptr;
@@ -66,7 +70,6 @@ bool GstPipelineWrapper::build_and_start_pipeline(int max_buffers, std::string* 
     // Start
     GstStateChangeReturn sret = gst_element_set_state(pipeline_, GST_STATE_PLAYING);
     if (sret == GST_STATE_CHANGE_FAILURE) {
-        // Decode detailed error
         GstBus* e_bus = gst_element_get_bus(pipeline_);
         if (GstMessage* msg = gst_bus_pop_filtered(e_bus, GST_MESSAGE_ERROR)) {
             GError* e = nullptr; gchar* debug = nullptr;
@@ -87,12 +90,19 @@ bool GstPipelineWrapper::build_and_start_pipeline(int max_buffers, std::string* 
 
     running_.store(true);
     std::cout << "✓ GStreamer decode-only pipeline started successfully" << std::endl;
-    std::cout << "  Using: nvv4l2decoder (hardware) → nvvidconv (I420) → appsink" << std::endl;
+    std::cout << "  Using: nvv4l2decoder (hardware) → nvvidconv (I420"
+              << ((desired_w_>0 && desired_h_>0) ? (", " + std::to_string(desired_w_) + "x" + std::to_string(desired_h_)) : "")
+              << ") → appsink" << std::endl;
     std::cout << "  Loop enabled: " << (loop_enabled_ ? "yes" : "no") << std::endl;
     return true;
 }
 
-bool GstPipelineWrapper::start(const std::string& file_path, FrameCallback cb, bool loop, int max_buffers) {
+bool GstPipelineWrapper::start(const std::string& file_path,
+                               FrameCallback cb,
+                               bool loop,
+                               int max_buffers,
+                               int desired_w,
+                               int desired_h) {
     std::lock_guard<std::mutex> lk(lifecycle_mtx_);
     if (running_.load()) {
         std::cerr << "GStreamer pipeline already running" << std::endl;
@@ -103,6 +113,8 @@ bool GstPipelineWrapper::start(const std::string& file_path, FrameCallback cb, b
     file_path_     = file_path;
     frames_processed_ = 0;
     width_ = height_ = 0;
+    desired_w_ = desired_w;
+    desired_h_ = desired_h;
 
     std::string err;
     if (!build_and_start_pipeline(max_buffers, &err)) {
@@ -121,13 +133,11 @@ void GstPipelineWrapper::stop() {
 }
 
 void GstPipelineWrapper::cleanup_pipeline() {
-    // Remove bus watch
     if (bus_watch_id_ > 0) {
         g_source_remove(bus_watch_id_);
         bus_watch_id_ = 0;
     }
 
-    // Drive to NULL
     if (pipeline_) {
         gst_element_set_state(pipeline_, GST_STATE_NULL);
         GstState cur = GST_STATE_NULL, pending = GST_STATE_NULL;
@@ -145,11 +155,8 @@ void GstPipelineWrapper::cleanup_pipeline() {
 }
 
 bool GstPipelineWrapper::restart_pipeline() {
-    // Restart with same params (safe teardown + re-build)
     std::cout << "Restarting decode-only pipeline for loop..." << std::endl;
     cleanup_pipeline();
-
-    // Small delay to ensure NVDEC userspace driver is fully torn down
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
     std::string err;
@@ -164,24 +171,19 @@ bool GstPipelineWrapper::restart_pipeline() {
 bool GstPipelineWrapper::try_seek_to_start() {
     if (!pipeline_) return false;
 
-    // Pause
     gst_element_set_state(pipeline_, GST_STATE_PAUSED);
     GstState cur = GST_STATE_PAUSED, pending = GST_STATE_VOID_PENDING;
     gst_element_get_state(pipeline_, &cur, &pending, 500 * GST_MSECOND);
 
-    // Seek to 0 (flush + keyunit)
     gboolean ok = gst_element_seek(
-        pipeline_,
-        1.0,                         // rate
-        GST_FORMAT_TIME,
+        pipeline_, 1.0, GST_FORMAT_TIME,
         GstSeekFlags(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT),
-        GST_SEEK_TYPE_SET, 0,        // start at 0
+        GST_SEEK_TYPE_SET, 0,
         GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE
     );
 
     if (!ok) return false;
 
-    // Back to playing
     gst_element_set_state(pipeline_, GST_STATE_PLAYING);
     gst_element_get_state(pipeline_, &cur, &pending, 500 * GST_MSECOND);
     return true;
@@ -197,16 +199,14 @@ void GstPipelineWrapper::handle_eos() {
     }
 
     std::cout << "Attempting to loop..." << std::endl;
-    // First try the efficient path (seek-to-start)
     if (try_seek_to_start()) {
         std::cout << "✓ Successfully seeked to beginning" << std::endl;
         return;
     }
 
-    // Fallback: full restart. Do it on a separate thread but with lifecycle lock inside.
     std::thread([this]() {
         std::lock_guard<std::mutex> lk(this->lifecycle_mtx_);
-        if (!this->running_.load()) return; // aborted meanwhile
+        if (!this->running_.load()) return;
         if (this->restart_pipeline()) {
             std::cout << "✓ Pipeline restarted successfully" << std::endl;
         } else {
@@ -232,7 +232,6 @@ GstFlowReturn GstPipelineWrapper::on_new_sample(GstAppSink* sink, gpointer user_
     GstSample* sample = gst_app_sink_pull_sample(sink);
     if (!sample) return GST_FLOW_OK;
 
-    // Update width/height lazily from caps (once)
     if (self->width_ == 0 || self->height_ == 0) {
         if (GstCaps* caps = gst_sample_get_caps(sample)) {
             if (GstStructure* st = gst_caps_get_structure(caps, 0)) {
@@ -251,7 +250,6 @@ GstFlowReturn GstPipelineWrapper::on_new_sample(GstAppSink* sink, gpointer user_
 
     GstMapInfo info;
     if (gst_buffer_map(buf, &info, GST_MAP_READ)) {
-        // Expect tight I420 packing
         try {
             self->frame_cb_(static_cast<const uint8_t*>(info.data), info.size, self->width_, self->height_);
             self->frames_processed_++;
@@ -273,14 +271,12 @@ gboolean GstPipelineWrapper::bus_callback(GstBus* /*bus*/, GstMessage* msg, gpoi
         case GST_MESSAGE_EOS:
             self->handle_eos();
             break;
-
         case GST_MESSAGE_ERROR: {
             GError* err = nullptr; gchar* debug = nullptr;
             gst_message_parse_error(msg, &err, &debug);
             self->handle_error(err, debug);
             break;
         }
-
         case GST_MESSAGE_WARNING: {
             GError* err = nullptr; gchar* debug = nullptr;
             gst_message_parse_warning(msg, &err, &debug);
@@ -289,7 +285,6 @@ gboolean GstPipelineWrapper::bus_callback(GstBus* /*bus*/, GstMessage* msg, gpoi
             if (err) g_error_free(err);
             break;
         }
-
         case GST_MESSAGE_STATE_CHANGED: {
             if (GST_MESSAGE_SRC(msg) == GST_OBJECT(self->pipeline_)) {
                 GstState old_state, new_state, pending_state;
@@ -300,8 +295,7 @@ gboolean GstPipelineWrapper::bus_callback(GstBus* /*bus*/, GstMessage* msg, gpoi
             }
             break;
         }
-
         default: break;
     }
-    return TRUE; // keep watching
+    return TRUE;
 }
