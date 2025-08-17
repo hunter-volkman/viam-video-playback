@@ -13,27 +13,71 @@
 #include <condition_variable>
 #include <vector>
 #include <queue>
-
-#if defined(USE_NVDEC)
-class GstPipelineWrapper;
-#endif
+#include <ring_buffer.hpp>
 
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
-#include <libavcodec/bsf.h>
 #include <libswscale/swscale.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
-#include <libavutil/hwcontext.h>
 }
+
+#if defined(__aarch64__)
+#include <gst/gst.h>
+#include <gst/app/gstappsink.h>
+#include <gst/video/video.h>
+#endif
 
 namespace hunter {
 namespace video_playback {
 
-struct EncodingTask {
-    AVFrame* frame;                                   // references memory owned by 'backing' if set
-    std::shared_ptr<std::vector<uint8_t>> backing;    // optional owner of plane data (for Jetson I420 path)
+// Lock-free ring buffer for zero-copy frame passing
+template<typename T, size_t Size>
+class RingBuffer {
+public:
+    bool try_push(T&& item) {
+        size_t current_write = write_pos_.load(std::memory_order_relaxed);
+        size_t next_write = (current_write + 1) % Size;
+        
+        if (next_write == read_pos_.load(std::memory_order_acquire)) {
+            return false; // Buffer full
+        }
+        
+        buffer_[current_write] = std::move(item);
+        write_pos_.store(next_write, std::memory_order_release);
+        return true;
+    }
+    
+    bool try_pop(T& item) {
+        size_t current_read = read_pos_.load(std::memory_order_relaxed);
+        
+        if (current_read == write_pos_.load(std::memory_order_acquire)) {
+            return false; // Buffer empty
+        }
+        
+        item = std::move(buffer_[current_read]);
+        read_pos_.store((current_read + 1) % Size, std::memory_order_release);
+        return true;
+    }
+    
+    size_t size() const {
+        size_t w = write_pos_.load(std::memory_order_acquire);
+        size_t r = read_pos_.load(std::memory_order_acquire);
+        return (w >= r) ? (w - r) : (Size - r + w);
+    }
+
+private:
+    std::array<T, Size> buffer_;
+    alignas(64) std::atomic<size_t> write_pos_{0};
+    alignas(64) std::atomic<size_t> read_pos_{0};
+};
+
+struct FrameData {
+    std::shared_ptr<std::vector<uint8_t>> data;
+    int width;
+    int height;
+    int64_t pts;
 };
 
 class VideoPlaybackCamera : public viam::sdk::Camera, public viam::sdk::Reconfigurable {
@@ -55,76 +99,76 @@ public:
     static viam::sdk::Model model();
 
 private:
+    // Core pipeline management
     void start_pipeline();
     void stop_pipeline();
-
-    // FFmpeg decode-only path (macOS/Linux x86)
+    
+#if defined(__aarch64__)
+    // Jetson-specific GStreamer pipeline
+    void setup_gstreamer_pipeline();
+    static GstFlowReturn on_new_sample(GstAppSink* sink, gpointer user_data);
+    static gboolean bus_callback(GstBus* bus, GstMessage* msg, gpointer user_data);
+    void handle_gst_frame(const uint8_t* data, size_t size, int width, int height);
+    
+    GstElement* pipeline_{nullptr};
+    GstElement* appsink_{nullptr};
+    guint bus_watch_id_{0};
+#else
+    // FFmpeg software decode path
     bool initialize_decoder(const std::string& path);
-    void producer_thread_func();
-    void receive_and_queue_frames(AVFrame* frame, AVFrame* sw_frame, std::chrono::high_resolution_clock::time_point& next_frame_time);
+    void decode_thread_func();
+#endif
 
-    // MJPEG encoder pool (shared)
+    // Shared JPEG encoding
     bool initialize_encoder_pool(int width, int height);
-    void cleanup_encoder_pool();
-    void consumer_thread_func(int thread_id);
-    bool encode_task(int thread_id, EncodingTask& task, std::vector<uint8_t>& jpeg_buffer);
-
-    // HW accel helpers
-    AVBufferRef* hw_device_ctx_{nullptr};
-    AVBufferRef* hw_frames_ctx_{nullptr};
-    AVBSFContext* bsf_ctx_{nullptr};
-    bool transfer_hw_frame_to_sw(AVFrame* src, AVFrame* dst);
-
-    // --- Config ---
+    void encoder_thread_func(int thread_id);
+    bool encode_frame_to_jpeg(AVFrame* frame, int thread_id, std::vector<uint8_t>& output);
+    
+    // Configuration
     std::string video_path_;
-    bool   loop_playback_{true};
-    int    target_fps_{0};
-    int    quality_level_{15};
-    int    output_width_{0};           // Jetson scaling
-    int    output_height_{0};          // Jetson scaling
-    int    appsink_max_buffers_{24};   // Jetson appsink queue
-
-    // --- FFmpeg demux/decoder (non-Jetson path) ---
-    AVFormatContext* format_ctx_{nullptr};
-    AVCodecContext*  decoder_ctx_{nullptr};
-    const AVCodec*   decoder_{nullptr};
-    int              video_stream_index_{-1};
-
-    // --- Shared producer/consumer queue ---
-    std::queue<EncodingTask> frame_queue_;
-    std::mutex               queue_mutex_;
-    std::condition_variable  queue_producer_cv_;
-    std::condition_variable  queue_consumer_cv_;
-    size_t                   max_queue_size_{10};
-
-    // --- MJPEG encoder threads ---
-    int                       num_encoder_threads_{4};
-    std::vector<std::thread>  encoder_threads_;
-    std::vector<AVCodecContext*> mjpeg_encoder_ctxs_;
-    std::vector<SwsContext*>     sws_contexts_;
-    std::vector<AVFrame*>        yuv_frames_;
-
-    // --- Latest JPEG for get_image ---
-    std::mutex                      jpeg_mutex_;
-    std::vector<uint8_t>            latest_jpeg_buffer_;
-    bool                            is_jpeg_ready_{false};
-    std::condition_variable         jpeg_ready_cv_;
+    bool loop_playback_{true};
+    int target_fps_{0};
+    int quality_level_{12};
+    int output_width_{1280};
+    int output_height_{720};
+    
+    // Performance tuning
+    static constexpr size_t FRAME_BUFFER_SIZE = 8;
+    static constexpr int MAX_ENCODER_THREADS = 4;
+    
+    // Lock-free frame queue for maximum throughput
+    RingBuffer<FrameData, FRAME_BUFFER_SIZE> frame_queue_;
+    
+    // JPEG encoder pool
+    int num_encoder_threads_;
+    std::vector<std::thread> encoder_threads_;
+    std::vector<AVCodecContext*> mjpeg_contexts_;
+    std::vector<AVFrame*> conversion_frames_;
+    std::vector<SwsContext*> sws_contexts_;
+    
+    // Latest JPEG frame (double buffered)
+    std::mutex jpeg_mutex_;
+    std::vector<uint8_t> front_buffer_;
+    std::vector<uint8_t> back_buffer_;
+    std::atomic<bool> new_frame_ready_{false};
     std::chrono::steady_clock::time_point last_frame_time_;
-
-    std::atomic<bool> is_running_{false};
-    std::thread       producer_thread_;  // only used in FFmpeg decode path
-
+    
+    // Pipeline state
+    std::atomic<bool> running_{false};
+    std::thread decode_thread_;
+    
+    // Performance metrics
     std::atomic<uint64_t> frames_decoded_{0};
     std::atomic<uint64_t> frames_encoded_{0};
-    std::atomic<uint64_t> frames_dropped_producer_{0};
-    std::atomic<uint64_t> frames_dropped_consumer_{0};
+    std::atomic<uint64_t> frames_dropped_{0};
     std::chrono::high_resolution_clock::time_point start_time_;
-
-    double source_fps_{30.0};
-    std::chrono::microseconds frame_duration_{std::chrono::microseconds(33333)};
-
-#if defined(USE_NVDEC)
-    std::unique_ptr<GstPipelineWrapper> gst_pipeline_;
+    
+    // FFmpeg components (non-Jetson)
+#if !defined(__aarch64__)
+    AVFormatContext* format_ctx_{nullptr};
+    AVCodecContext* decoder_ctx_{nullptr};
+    const AVCodec* decoder_{nullptr};
+    int video_stream_index_{-1};
 #endif
 };
 
