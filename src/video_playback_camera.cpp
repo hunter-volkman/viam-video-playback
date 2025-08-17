@@ -44,6 +44,9 @@ VideoPlaybackCamera::VideoPlaybackCamera(
 #ifdef USE_NVDEC
     std::cout << "NVIDIA hardware acceleration support enabled" << std::endl;
 #endif
+#ifdef USE_VIDEOTOOLBOX
+    std::cout << "VideoToolbox hardware acceleration support enabled" << std::endl;
+#endif
     
     reconfigure(deps, cfg);
 }
@@ -163,25 +166,81 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
     AVStream* video_stream = format_ctx_->streams[video_stream_index_];
     source_fps_ = av_q2d(video_stream->r_frame_rate);
     
-    // Try to use hardware decoder on Jetson
-#ifdef USE_NVDEC
+    // Initialize decoder pointer
+    decoder_ = nullptr;
+    
+    // Try to use hardware decoder if requested
     if (use_hardware_accel_) {
-        // Try NVIDIA V4L2 decoder first
+#ifdef USE_NVDEC
+        // On Jetson, try NVIDIA hardware decoders
         if (video_stream->codecpar->codec_id == AV_CODEC_ID_H264) {
-            decoder_ = avcodec_find_decoder_by_name("h264_v4l2m2m");
+            // Try nvv4l2decoder (newer) first
+            decoder_ = avcodec_find_decoder_by_name("h264_nvv4l2dec");
             if (decoder_) {
-                std::cout << "Using NVIDIA V4L2 H.264 hardware decoder" << std::endl;
+                std::cout << "Using NVIDIA nvv4l2 H.264 hardware decoder" << std::endl;
+            } else {
+                // Fall back to nvdec
+                decoder_ = avcodec_find_decoder_by_name("h264_nvdec");
+                if (decoder_) {
+                    std::cout << "Using NVIDIA nvdec H.264 hardware decoder" << std::endl;
+                } else {
+                    // Try the generic v4l2 decoder
+                    decoder_ = avcodec_find_decoder_by_name("h264_v4l2m2m");
+                    if (decoder_) {
+                        std::cout << "Using V4L2 H.264 hardware decoder" << std::endl;
+                    }
+                }
             }
         } else if (video_stream->codecpar->codec_id == AV_CODEC_ID_HEVC) {
-            decoder_ = avcodec_find_decoder_by_name("hevc_v4l2m2m");
+            decoder_ = avcodec_find_decoder_by_name("hevc_nvv4l2dec");
             if (decoder_) {
-                std::cout << "Using NVIDIA V4L2 HEVC hardware decoder" << std::endl;
+                std::cout << "Using NVIDIA nvv4l2 HEVC hardware decoder" << std::endl;
+            } else {
+                decoder_ = avcodec_find_decoder_by_name("hevc_nvdec");
+                if (decoder_) {
+                    std::cout << "Using NVIDIA nvdec HEVC hardware decoder" << std::endl;
+                } else {
+                    decoder_ = avcodec_find_decoder_by_name("hevc_v4l2m2m");
+                    if (decoder_) {
+                        std::cout << "Using V4L2 HEVC hardware decoder" << std::endl;
+                    }
+                }
             }
         }
-    }
+        
+        if (!decoder_) {
+            std::cout << "NVIDIA hardware decoder not available, falling back to software" << std::endl;
+        }
 #endif
+
+#ifdef USE_VIDEOTOOLBOX
+        // On macOS, try VideoToolbox decoder
+        if (!decoder_) {
+            if (video_stream->codecpar->codec_id == AV_CODEC_ID_H264) {
+                decoder_ = avcodec_find_decoder_by_name("h264_videotoolbox");
+                if (decoder_) {
+                    std::cout << "Using VideoToolbox H.264 hardware decoder" << std::endl;
+                }
+            } else if (video_stream->codecpar->codec_id == AV_CODEC_ID_HEVC) {
+                decoder_ = avcodec_find_decoder_by_name("hevc_videotoolbox");
+                if (decoder_) {
+                    std::cout << "Using VideoToolbox HEVC hardware decoder" << std::endl;
+                }
+            } else if (video_stream->codecpar->codec_id == AV_CODEC_ID_VP9) {
+                decoder_ = avcodec_find_decoder_by_name("vp9_videotoolbox");
+                if (decoder_) {
+                    std::cout << "Using VideoToolbox VP9 hardware decoder" << std::endl;
+                }
+            }
+            
+            if (!decoder_) {
+                std::cout << "VideoToolbox hardware decoder not available, falling back to software" << std::endl;
+            }
+        }
+#endif
+    }
     
-    // Fall back to software decoder
+    // Fall back to software decoder if hardware decoder not found or not requested
     if (!decoder_) {
         decoder_ = avcodec_find_decoder(video_stream->codecpar->codec_id);
         if (!decoder_) {
@@ -199,19 +258,68 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
     }
     
     // Copy codec parameters
-    avcodec_parameters_to_context(decoder_ctx_, video_stream->codecpar);
+    if (avcodec_parameters_to_context(decoder_ctx_, video_stream->codecpar) < 0) {
+        std::cerr << "Error: Failed to copy codec parameters" << std::endl;
+        avcodec_free_context(&decoder_ctx_);
+        return false;
+    }
     
-    // Use multiple threads for decoding (software decoder)
-    if (strstr(decoder_->name, "v4l2") == nullptr) {
+    // Configure threading for software decoders only
+    if (strstr(decoder_->name, "videotoolbox") == nullptr && 
+        strstr(decoder_->name, "nvdec") == nullptr &&
+        strstr(decoder_->name, "nvv4l2") == nullptr &&
+        strstr(decoder_->name, "v4l2") == nullptr) {
+        // This is a software decoder, use multiple threads
         decoder_ctx_->thread_count = num_encoder_threads_;
         decoder_ctx_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
     }
     
     // Open decoder
-    if (avcodec_open2(decoder_ctx_, decoder_, nullptr) < 0) {
-        std::cerr << "Error: Failed to open decoder" << std::endl;
-        avcodec_free_context(&decoder_ctx_);
-        return false;
+    int ret = avcodec_open2(decoder_ctx_, decoder_, nullptr);
+    if (ret < 0) {
+        char errbuf[256];
+        av_strerror(ret, errbuf, sizeof(errbuf));
+        std::cerr << "Error: Failed to open decoder: " << errbuf << std::endl;
+        
+        // If hardware decoder failed, try falling back to software
+        if (use_hardware_accel_) {
+            std::cout << "Hardware decoder failed, falling back to software decoder" << std::endl;
+            avcodec_free_context(&decoder_ctx_);
+            
+            // Try software decoder
+            decoder_ = avcodec_find_decoder(video_stream->codecpar->codec_id);
+            if (!decoder_) {
+                std::cerr << "Error: Software codec not found" << std::endl;
+                return false;
+            }
+            
+            decoder_ctx_ = avcodec_alloc_context3(decoder_);
+            if (!decoder_ctx_) {
+                std::cerr << "Error: Failed to allocate software decoder context" << std::endl;
+                return false;
+            }
+            
+            if (avcodec_parameters_to_context(decoder_ctx_, video_stream->codecpar) < 0) {
+                std::cerr << "Error: Failed to copy codec parameters for software decoder" << std::endl;
+                avcodec_free_context(&decoder_ctx_);
+                return false;
+            }
+            
+            // Configure threading for software decoder
+            decoder_ctx_->thread_count = num_encoder_threads_;
+            decoder_ctx_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+            
+            if (avcodec_open2(decoder_ctx_, decoder_, nullptr) < 0) {
+                std::cerr << "Error: Failed to open software decoder" << std::endl;
+                avcodec_free_context(&decoder_ctx_);
+                return false;
+            }
+            
+            std::cout << "Successfully opened software decoder: " << decoder_->name << std::endl;
+        } else {
+            avcodec_free_context(&decoder_ctx_);
+            return false;
+        }
     }
     
     // Calculate frame timing
@@ -236,12 +344,8 @@ bool VideoPlaybackCamera::initialize_encoder_pool(int width, int height) {
     
     const AVCodec* mjpeg_encoder = nullptr;
     
-#ifdef USE_NVDEC
-    // On Jetson, try to use hardware MJPEG encoder
-    // Note: Jetson doesn't have hardware MJPEG, so we still use software
-    // but we could potentially use NVJPEG library in the future
-#endif
-    
+    // Always use software MJPEG encoder for now
+    // (Hardware MJPEG encoding is not commonly available)
     mjpeg_encoder = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
     if (!mjpeg_encoder) {
         std::cerr << "Error: MJPEG encoder not found" << std::endl;
@@ -295,8 +399,19 @@ bool VideoPlaybackCamera::initialize_encoder_pool(int width, int height) {
         bool needs_conversion = (decoder_ctx_->pix_fmt != AV_PIX_FMT_YUVJ420P);
         
         if (needs_scaling || needs_conversion) {
+            // Determine source pixel format (handle hardware decoder formats)
+            AVPixelFormat src_fmt = decoder_ctx_->pix_fmt;
+            
+            // For hardware decoders, we might get NV12 or other formats
+            if (src_fmt == AV_PIX_FMT_VIDEOTOOLBOX || 
+                src_fmt == AV_PIX_FMT_CUDA ||
+                src_fmt == AV_PIX_FMT_VAAPI) {
+                // Hardware formats will be converted automatically during decoding
+                src_fmt = AV_PIX_FMT_NV12;  // Common hardware output format
+            }
+            
             sws_contexts_[i] = sws_getContext(
-                decoder_ctx_->width, decoder_ctx_->height, decoder_ctx_->pix_fmt,
+                decoder_ctx_->width, decoder_ctx_->height, src_fmt,
                 width, height, AV_PIX_FMT_YUVJ420P,
                 SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
             
@@ -622,6 +737,7 @@ vs::ProtoStruct VideoPlaybackCamera::do_command(const vs::ProtoStruct& command) 
         stats["output_width"] = vs::ProtoValue(output_width_);
         stats["output_height"] = vs::ProtoValue(output_height_);
         stats["hardware_accel"] = vs::ProtoValue(use_hardware_accel_);
+        stats["decoder_name"] = vs::ProtoValue(std::string(decoder_ ? decoder_->name : "unknown"));
         
         return stats;
     }
