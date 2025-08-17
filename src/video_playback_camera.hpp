@@ -13,7 +13,7 @@
 #include <condition_variable>
 #include <vector>
 #include <queue>
-#include <ring_buffer.hpp>
+#include <array>
 
 extern "C" {
 #include <libavformat/avformat.h>
