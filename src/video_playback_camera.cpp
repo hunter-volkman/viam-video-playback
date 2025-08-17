@@ -30,7 +30,7 @@ std::shared_ptr<vs::Resource> VideoPlaybackCamera::create(const vs::Dependencies
 VideoPlaybackCamera::VideoPlaybackCamera(const vs::Dependencies& deps, const vs::ResourceConfig& cfg)
     : vs::Camera(cfg.name()) {
     
-#if defined(__aarch64__)
+#if defined(__aarch64__) && defined(__linux__)
     // Jetson Orin NX: 6 cores, use 4 for encoding (leave 2 for decode/system)
     num_encoder_threads_ = 4;
     std::cout << "[JETSON] Optimized for Orin NX with " << num_encoder_threads_ << " encoder threads" << std::endl;
@@ -79,7 +79,7 @@ void VideoPlaybackCamera::reconfigure(const vs::Dependencies& deps, const vs::Re
     std::cout << "  JPEG Quality: " << quality_level_ << std::endl;
     std::cout << "  Loop: " << (loop_playback_ ? "yes" : "no") << std::endl;
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) && defined(__linux__)
     setup_gstreamer_pipeline();
 #else
     if (!initialize_decoder(video_path_)) {
@@ -93,7 +93,7 @@ void VideoPlaybackCamera::reconfigure(const vs::Dependencies& deps, const vs::Re
     start_pipeline();
 }
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) && defined(__linux__)
 void VideoPlaybackCamera::setup_gstreamer_pipeline() {
     // Initialize GStreamer
     if (!gst_is_initialized()) {
@@ -543,7 +543,7 @@ void VideoPlaybackCamera::start_pipeline() {
         encoder_threads_.emplace_back(&VideoPlaybackCamera::encoder_thread_func, this, i);
     }
     
-#if !defined(__aarch64__)
+#if !defined(__aarch64__) || !defined(__linux__)
     // Start decode thread for non-Jetson platforms
     decode_thread_ = std::thread(&VideoPlaybackCamera::decode_thread_func, this);
 #endif
@@ -568,7 +568,7 @@ void VideoPlaybackCamera::stop_pipeline() {
     }
     encoder_threads_.clear();
     
-#if defined(__aarch64__)
+#if defined(__aarch64__) && defined(__linux__)
     // Cleanup GStreamer
     if (pipeline_) {
         gst_element_set_state(pipeline_, GST_STATE_NULL);
@@ -690,7 +690,7 @@ vs::ProtoStruct VideoPlaybackCamera::do_command(const vs::ProtoStruct& command) 
         stats["actual_fps"] = vs::ProtoValue(static_cast<double>(frames_encoded_.load()) / elapsed);
     }
     
-#if defined(__aarch64__)
+#if defined(__aarch64__) && defined(__linux__)
     stats["pipeline"] = vs::ProtoValue(std::string("GStreamer HW (nvv4l2decoder)"));
 #else
     stats["pipeline"] = vs::ProtoValue(std::string("FFmpeg SW"));

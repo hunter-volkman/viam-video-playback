@@ -23,7 +23,7 @@ extern "C" {
 #include <libavutil/opt.h>
 }
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) && defined(__linux__)
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
 #include <gst/video/video.h>
@@ -103,7 +103,7 @@ private:
     void start_pipeline();
     void stop_pipeline();
     
-#if defined(__aarch64__)
+#if defined(__aarch64__) && defined(__linux__)
     // Jetson-specific GStreamer pipeline
     void setup_gstreamer_pipeline();
     static GstFlowReturn on_new_sample(GstAppSink* sink, gpointer user_data);
@@ -164,7 +164,7 @@ private:
     std::chrono::high_resolution_clock::time_point start_time_;
     
     // FFmpeg components (non-Jetson)
-#if !defined(__aarch64__)
+#if !defined(__aarch64__) || !defined(__linux__)
     AVFormatContext* format_ctx_{nullptr};
     AVCodecContext* decoder_ctx_{nullptr};
     const AVCodec* decoder_{nullptr};
