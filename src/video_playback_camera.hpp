@@ -87,8 +87,12 @@ private:
     // --- Member Variables ---
     std::string video_path_;
     bool loop_playback_{true};
-    int  target_fps_{0};
+    int  target_fps_{0};          // limit encode rate (Jetson callback throttle + FFmpeg producer timing)
     int  quality_level_{15};
+
+    // Optional output scaler target for Jetson (decoded & scaled by nvvidconv before appsink)
+    int  output_width_{0};
+    int  output_height_{0};
 
     // FFmpeg decode (macOS/other)
     AVFormatContext* format_ctx_{nullptr};
@@ -131,10 +135,14 @@ private:
     // GStreamer pipeline wrapper (Jetson decode-only fast path)
     std::unique_ptr<GstPipelineWrapper> gst_pipeline_;
 
-    // Lazy init for encoder pool once we know width/height from first sample
+    // Lazy init for encoder pool once dimensions are known
     std::mutex encoder_init_mtx_;
     bool encoder_threads_started_{false};
     int enc_width_{0}, enc_height_{0};
+
+    // Callback throttle state (Jetson)
+    std::chrono::microseconds throttle_period_{0};
+    std::chrono::steady_clock::time_point next_due_{};
 #endif
 };
 
