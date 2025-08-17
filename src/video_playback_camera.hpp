@@ -2,7 +2,9 @@
 
 #include <viam/sdk/components/camera.hpp>
 #include <viam/sdk/resource/reconfigurable.hpp>
+#include <viam/sdk/resource/resource.hpp>
 #include <viam/sdk/config/resource.hpp>
+
 #include <atomic>
 #include <memory>
 #include <thread>
@@ -49,7 +51,7 @@ public:
     viam::sdk::ProtoStruct do_command(const viam::sdk::ProtoStruct& command) override;
     std::vector<viam::sdk::GeometryConfig> get_geometries(const viam::sdk::ProtoStruct& extra) override;
 
-    static std::shared_ptr[viam::sdk::Resource] create(const viam::sdk::Dependencies& deps, const viam::sdk::ResourceConfig& cfg);
+    static std::shared_ptr<viam::sdk::Resource> create(const viam::sdk::Dependencies& deps, const viam::sdk::ResourceConfig& cfg);
     static viam::sdk::Model model();
 
 private:
