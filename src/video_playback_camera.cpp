@@ -7,14 +7,13 @@
 #include <string>
 #include <functional>
 #include <memory>
+#include <algorithm>
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-
 extern "C" {
 #include <libavutil/opt.h>
 }
-
 #pragma GCC diagnostic pop
 
 #if defined(USE_NVDEC)
@@ -31,7 +30,7 @@ vs::Model VideoPlaybackCamera::model() {
 }
 
 std::shared_ptr<vs::Resource> VideoPlaybackCamera::create(const vs::Dependencies& deps,
-                                                         const vs::ResourceConfig& cfg) {
+                                                          const vs::ResourceConfig& cfg) {
     return std::make_shared<VideoPlaybackCamera>(deps, cfg);
 }
 
@@ -70,15 +69,9 @@ void VideoPlaybackCamera::reconfigure(const vs::Dependencies& deps, const vs::Re
     if (attrs.find("output_height") != attrs.end()) {
         output_height_ = static_cast<int>(*attrs.at("output_height").get<double>());
     }
-
-#if defined(USE_NVDEC)
-    // Compute throttle period if a target fps was requested
-    if (target_fps_ > 0) {
-        throttle_period_ = std::chrono::microseconds(static_cast<int64_t>(1000000.0 / target_fps_));
-    } else {
-        throttle_period_ = std::chrono::microseconds(0);
+    if (attrs.find("appsink_max_buffers") != attrs.end()) {
+        appsink_max_buffers_ = static_cast<int>(*attrs.at("appsink_max_buffers").get<double>());
     }
-#endif
 
     std::cout << "Reconfiguring video playback:" << std::endl;
     std::cout << "  - Path: " << video_path_ << std::endl;
@@ -92,105 +85,93 @@ void VideoPlaybackCamera::reconfigure(const vs::Dependencies& deps, const vs::Re
 #endif
 
 #if defined(USE_NVDEC)
-    // ================================================================================
-    // JETSON PATH: Decode-only GStreamer pipeline (I420) + FFmpeg MJPEG encoding in-process
-    // ================================================================================
+    // JETSON PATH: GStreamer HW decode → tight I420 → FFmpeg MJPEG pool (CPU)
     try {
         if (!gst_pipeline_) {
             gst_pipeline_ = std::make_unique<GstPipelineWrapper>();
         }
 
-        // Frame callback from GStreamer: I420 contiguous buffer, tight strides
+        // Encode consumer threads will be started by start_pipeline() after we initialize the pool
+        // We lazily initialize the encoder pool on first frame if width/height are unknown.
+
         auto cb = [this](const uint8_t* data, size_t size, int width, int height) {
-            // Throttle to target_fps_ if configured
-            if (throttle_period_.count() > 0) {
-                const auto now = std::chrono::steady_clock::now();
-                if (now < next_due_) {
-                    frames_dropped_producer_.fetch_add(1);
-                    return; // drop this frame
-                }
-                next_due_ = now + throttle_period_;
-            }
-
-            // Lazy init encoder pool once we know the actual dimensions
-            {
-                std::lock_guard<std::mutex> lk(this->encoder_init_mtx_);
-                if (!this->encoder_threads_started_ ||
-                    width != this->enc_width_ || height != this->enc_height_) {
-                    // (Re)initialize encoder pool for MJPEG with new w/h
-                    this->cleanup_encoder_pool();
-                    if (!this->initialize_encoder_pool(width, height)) {
-                        std::cerr << "Failed to initialize MJPEG encoder pool (Jetson path)" << std::endl;
-                        return;
-                    }
-                    this->enc_width_ = width;
-                    this->enc_height_ = height;
-
-                    // Start consumer threads once
-                    if (!this->encoder_threads_started_) {
-                        this->encoder_threads_.clear();
-                        for (int i = 0; i < this->num_encoder_threads_; ++i) {
-                            this->encoder_threads_.emplace_back(&VideoPlaybackCamera::consumer_thread_func, this, i);
-                        }
-                        this->encoder_threads_started_ = true;
-                    }
+            // Lazily init the encoder pool once we know output resolution
+            if (mjpeg_encoder_ctxs_.empty()) {
+                if (!initialize_encoder_pool(width, height)) {
+                    std::cerr << "Failed to initialize MJPEG encoder pool at " << width << "x" << height << std::endl;
+                    return;
                 }
             }
 
-            frames_decoded_.fetch_add(1);
+            // Build an EncodingTask that references this I420 buffer without extra copies in the consumer
+            auto backing = std::make_shared<std::vector<uint8_t>>(data, data + size);
+            AVFrame* src = av_frame_alloc();
+            src->format = AV_PIX_FMT_YUV420P; // tight I420
+            src->width  = width;
+            src->height = height;
 
-            // Copy the I420 buffer into a shared vector (appsink buffer is ephemeral)
-            auto buffer = std::make_shared<std::vector<uint8_t>>();
-            buffer->resize(size);
-            std::memcpy(buffer->data(), data, size);
+            const int w = width;
+            const int h = height;
+            const int uv_w = w / 2;
+            const int uv_h = h / 2;
+            const size_t y_sz = static_cast<size_t>(w) * h;
+            uint8_t* base = backing->data();
 
-            // Enqueue for MJPEG encoding
+            src->data[0]     = base;
+            src->linesize[0] = w;
+            src->data[1]     = base + y_sz;
+            src->linesize[1] = uv_w;
+            src->data[2]     = base + y_sz + static_cast<size_t>(uv_w) * uv_h;
+            src->linesize[2] = uv_w;
+
+            EncodingTask task{src, backing};
+
+            // Push to queue (drop if full)
             {
                 std::unique_lock<std::mutex> lock(queue_mutex_);
                 if (frame_queue_.size() >= max_queue_size_) {
                     frames_dropped_producer_.fetch_add(1);
-                } else {
-                    EncodingTask t;
-                    t.raw = buffer;
-                    t.width = width;
-                    t.height = height;
-                    frame_queue_.push(std::move(t));
-                    lock.unlock();
-                    queue_consumer_cv_.notify_one();
+                    av_frame_free(&src);
+                    return;
                 }
+                frame_queue_.push(std::move(task));
             }
-
-            // Wake get_image waiters in case the pipeline just started
-            jpeg_ready_cv_.notify_all();
-            last_frame_time_ = std::chrono::steady_clock::now();
+            queue_consumer_cv_.notify_one();
+            frames_decoded_.fetch_add(1);
         };
 
-        if (gst_pipeline_->start(video_path_, cb, loop_playback_, /*max_buffers*/ 6, output_width_, output_height_)) {
-            std::cout << "✓ GStreamer decode-only pipeline started successfully" << std::endl;
-            std::cout << "  Using: nvv4l2decoder (hardware) → nvvidconv (I420"
-                      << ((output_width_>0 && output_height_>0) ? (", " + std::to_string(output_width_) + "x" + std::to_string(output_height_)) : "")
-                      << ") → appsink" << std::endl;
-            std::cout << "  MJPEG: FFmpeg (libavcodec) in-process encoder pool" << std::endl;
+        std::cout << "MJPEG: FFmpeg (libavcodec) in-process encoder pool" << std::endl;
 
-            is_running_ = true;
-            start_time_ = std::chrono::high_resolution_clock::now();
-            next_due_ = std::chrono::steady_clock::now(); // start throttle window
-            return;  // success
+        if (!gst_pipeline_->start(video_path_,
+                                  cb,
+                                  loop_playback_,
+                                  appsink_max_buffers_,
+                                  output_width_,
+                                  output_height_,
+                                  target_fps_)) {
+            throw vs::Exception("GStreamer decode pipeline failed to start. "
+                                "Verify file path/permissions, codec support, and GStreamer plugins.");
         }
-        throw vs::Exception("GStreamer pipeline failed to start. "
-                            "Verify file path/permissions, codec support, and GStreamer plugins.");
+
+        std::cout << "Using: nvv4l2decoder (hardware) → nvvidconv (I420"
+                  << ((output_width_ > 0 && output_height_ > 0) ? (", " + std::to_string(output_width_) + "x" + std::to_string(output_height_)) : "")
+                  << ") → appsink" << std::endl;
+
+        // Start encoder consumers only (GStreamer drives the producer via callback)
+        is_running_ = true;
+        start_time_ = std::chrono::high_resolution_clock::now();
+        start_pipeline(); // will only spin consumer threads (no producer thread for Jetson path)
+        return;
     } catch (const std::exception& ex) {
         throw vs::Exception(std::string("GStreamer initialization failed: ") + ex.what());
     }
 #else
-    // ================================================================================
-    // MACOS/OTHER PLATFORMS: Use FFmpeg software pipeline (decode) + MJPEG encoder pool
-    // ================================================================================
+    // OTHER PLATFORMS: FFmpeg software pipeline (decode → queue → MJPEG pool)
     if (!initialize_decoder(video_path_)) {
         throw vs::Exception("Failed to initialize video decoder for: " + video_path_);
     }
     if (!initialize_encoder_pool(decoder_ctx_->width, decoder_ctx_->height)) {
-        throw vs::Exception("Failed to initialize JPEG encoder pool.");
+        throw vs::Exception("Failed to initialize MJPEG encoder pool.");
     }
     start_pipeline();
 #endif
@@ -221,7 +202,6 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
     source_fps_ = av_q2d(video_stream->r_frame_rate);
 
 #if defined(USE_VIDEOTOOLBOX)
-    // macOS: try VideoToolbox
     const AVCodec* hw_decoder = nullptr;
     if (video_stream->codecpar->codec_id == AV_CODEC_ID_H264) {
         hw_decoder = avcodec_find_decoder_by_name("h264_videotoolbox");
@@ -297,21 +277,16 @@ bool VideoPlaybackCamera::initialize_encoder_pool(int width, int height) {
     yuv_frames_.resize(num_encoder_threads_);
 
     for (int i = 0; i < num_encoder_threads_; ++i) {
-        // Create encoder context
         mjpeg_encoder_ctxs_[i] = avcodec_alloc_context3(mjpeg_encoder);
         AVCodecContext* ctx = mjpeg_encoder_ctxs_[i];
 
-        ctx->pix_fmt  = AV_PIX_FMT_YUVJ420P;
+        ctx->pix_fmt  = AV_PIX_FMT_YUVJ420P;  // full-range JPEG flavor
         ctx->width    = width;
         ctx->height   = height;
-        ctx->time_base = AVRational{1, (target_fps_ > 0) ? target_fps_ : static_cast<int>(source_fps_)};
+        ctx->time_base = AVRational{1, (target_fps_ > 0) ? target_fps_ : 30};
 
         AVDictionary* opts = nullptr;
         av_dict_set(&opts, "strict", "-2", 0);
-        if (quality_level_ > 0) {
-            av_opt_set(ctx->priv_data, "q", std::to_string(quality_level_).c_str(), 0);
-        }
-
         if (avcodec_open2(ctx, mjpeg_encoder, &opts) < 0) {
             av_dict_free(&opts);
             std::cerr << "Error: Failed to open MJPEG encoder for thread " << i << std::endl;
@@ -319,12 +294,13 @@ bool VideoPlaybackCamera::initialize_encoder_pool(int width, int height) {
         }
         av_dict_free(&opts);
 
-        // Allocate destination YUV frame for JPEG encoder
+        // Quality level: 2(best)..31(worst); our attribute approx aligns w/ libjpeg scale
+        av_opt_set(ctx->priv_data, "q", std::to_string(quality_level_).c_str(), 0);
+
         yuv_frames_[i] = av_frame_alloc();
         yuv_frames_[i]->format = AV_PIX_FMT_YUVJ420P;
         yuv_frames_[i]->width  = width;
         yuv_frames_[i]->height = height;
-
         if (av_frame_get_buffer(yuv_frames_[i], 32) < 0) {
             std::cerr << "Error: Failed to allocate YUV frame buffer for thread " << i << std::endl;
             return false;
@@ -334,10 +310,15 @@ bool VideoPlaybackCamera::initialize_encoder_pool(int width, int height) {
 }
 
 void VideoPlaybackCamera::cleanup_encoder_pool() {
-    for (auto& ctx : mjpeg_encoder_ctxs_) { if (ctx) avcodec_free_context(&ctx); }
-    for (auto& frame : yuv_frames_)       { if (frame) av_frame_free(&frame); }
-    for (auto& sws_ctx : sws_contexts_)   { if (sws_ctx) sws_freeContext(sws_ctx); }
-
+    for (auto& ctx : mjpeg_encoder_ctxs_) {
+        if (ctx) avcodec_free_context(&ctx);
+    }
+    for (auto& frame : yuv_frames_) {
+        if (frame) av_frame_free(&frame);
+    }
+    for (auto& sws_ctx : sws_contexts_) {
+        if (sws_ctx) sws_freeContext(sws_ctx);
+    }
     mjpeg_encoder_ctxs_.clear();
     yuv_frames_.clear();
     sws_contexts_.clear();
@@ -345,14 +326,20 @@ void VideoPlaybackCamera::cleanup_encoder_pool() {
 
 void VideoPlaybackCamera::start_pipeline() {
     if (is_running_) return;
-    is_running_ = true;
-    start_time_ = std::chrono::high_resolution_clock::now();
 
 #if defined(USE_NVDEC)
-    // On Jetson we don't start FFmpeg producer; GStreamer drives production via callback.
-    (void)0;
+    // Jetson path: GStreamer callback is the producer; we only spawn encoder consumers.
+    is_running_ = true;
+    encoder_threads_.reserve(num_encoder_threads_);
+    for (int i = 0; i < num_encoder_threads_; ++i) {
+        encoder_threads_.emplace_back(&VideoPlaybackCamera::consumer_thread_func, this, i);
+    }
 #else
+    // FFmpeg path: spawn producer + consumers
+    is_running_ = true;
+    start_time_ = std::chrono::high_resolution_clock::now();
     producer_thread_ = std::thread(&VideoPlaybackCamera::producer_thread_func, this);
+    encoder_threads_.reserve(num_encoder_threads_);
     for (int i = 0; i < num_encoder_threads_; ++i) {
         encoder_threads_.emplace_back(&VideoPlaybackCamera::consumer_thread_func, this, i);
     }
@@ -365,13 +352,7 @@ void VideoPlaybackCamera::stop_pipeline() {
         try { gst_pipeline_->stop(); } catch (...) {}
         gst_pipeline_.reset();
     }
-    {
-        std::lock_guard<std::mutex> lk(encoder_init_mtx_);
-        encoder_threads_started_ = false;
-        enc_width_ = enc_height_ = 0;
-    }
 #endif
-
     if (!is_running_) return;
     is_running_ = false;
 
@@ -383,9 +364,9 @@ void VideoPlaybackCamera::stop_pipeline() {
     for (auto& t : encoder_threads_) if (t.joinable()) t.join();
     encoder_threads_.clear();
 
-    if (bsf_ctx_) { av_bsf_free(&bsf_ctx_); bsf_ctx_ = nullptr; }
-    if (hw_frames_ctx_) { av_buffer_unref(&hw_frames_ctx_); hw_frames_ctx_ = nullptr; }
-    if (hw_device_ctx_) { av_buffer_unref(&hw_device_ctx_); hw_device_ctx_ = nullptr; }
+    if (bsf_ctx_)        { av_bsf_free(&bsf_ctx_); bsf_ctx_ = nullptr; }
+    if (hw_frames_ctx_)  { av_buffer_unref(&hw_frames_ctx_); hw_frames_ctx_ = nullptr; }
+    if (hw_device_ctx_)  { av_buffer_unref(&hw_device_ctx_); hw_device_ctx_ = nullptr; }
 
     cleanup_encoder_pool();
 
@@ -393,16 +374,14 @@ void VideoPlaybackCamera::stop_pipeline() {
     if (format_ctx_)  { avformat_close_input(&format_ctx_);  format_ctx_  = nullptr; }
 
     while (!frame_queue_.empty()) {
-        if (frame_queue_.front().frame) {
-            av_frame_free(&frame_queue_.front().frame);
-        }
+        if (frame_queue_.front().frame) av_frame_free(&frame_queue_.front().frame);
         frame_queue_.pop();
     }
 }
 
 void VideoPlaybackCamera::producer_thread_func() {
-    AVPacket* packet = av_packet_alloc();
-    AVFrame*  frame  = av_frame_alloc();
+    AVPacket* packet   = av_packet_alloc();
+    AVFrame*  frame    = av_frame_alloc();
     AVFrame*  sw_frame = av_frame_alloc();
     auto next_frame_time = std::chrono::high_resolution_clock::now();
 
@@ -483,9 +462,7 @@ void VideoPlaybackCamera::receive_and_queue_frames(AVFrame* frame, AVFrame* sw_f
                 frames_dropped_producer_++;
                 av_frame_free(&frame_to_queue);
             } else {
-                EncodingTask t;
-                t.frame = frame_to_queue;
-                frame_queue_.push(std::move(t));
+                frame_queue_.push({frame_to_queue, nullptr});
                 lock.unlock();
                 queue_consumer_cv_.notify_one();
             }
@@ -494,17 +471,13 @@ void VideoPlaybackCamera::receive_and_queue_frames(AVFrame* frame, AVFrame* sw_f
     }
 }
 
-static inline void copy_plane_tight_to_padded(uint8_t* dst, int dst_stride,
-                                              const uint8_t* src, int src_stride,
-                                              int width, int height) {
-    // src_stride is tight (width for Y, width/2 for U/V). dst may be padded.
-    for (int y = 0; y < height; ++y) {
-        std::memcpy(dst + y * dst_stride, src + y * src_stride, (size_t)width);
-    }
-}
-
 void VideoPlaybackCamera::consumer_thread_func(int thread_id) {
     std::vector<uint8_t> local_jpeg_buffer;
+    if (!mjpeg_encoder_ctxs_.empty()) {
+        int w = mjpeg_encoder_ctxs_[thread_id]->width;
+        int h = mjpeg_encoder_ctxs_[thread_id]->height;
+        local_jpeg_buffer.reserve(static_cast<size_t>(w) * h);
+    }
 
     while (is_running_) {
         std::unique_lock<std::mutex> lock(queue_mutex_);
@@ -530,110 +503,39 @@ void VideoPlaybackCamera::consumer_thread_func(int thread_id) {
             frames_dropped_consumer_++;
         }
 
-        if (task.frame) {
-            av_frame_free(&task.frame);
-        }
+        if (task.frame) av_frame_free(&task.frame);
+        // 'backing' will auto-release
     }
     std::cout << "Consumer thread " << thread_id << " finished" << std::endl;
 }
 
 bool VideoPlaybackCamera::encode_task(int thread_id, EncodingTask& task,
-                                     std::vector<uint8_t>& jpeg_buffer) {
-    AVFrame* dst_yuv = yuv_frames_[thread_id];
+                                      std::vector<uint8_t>& jpeg_buffer) {
+    if (mjpeg_encoder_ctxs_.empty()) return false;
 
-    // Jetson fast path: I420 already at target size → copy planes directly (no sws)
-    if (task.raw && task.width == dst_yuv->width && task.height == dst_yuv->height) {
-        const int w  = task.width;
-        const int h  = task.height;
-        const int w2 = w / 2;
-        const int h2 = h / 2;
-        const size_t y_size  = static_cast<size_t>(w) * h;
-        const size_t u_size  = static_cast<size_t>(w2) * h2;
+    AVFrame* yuv_frame = yuv_frames_[thread_id];
 
-        const uint8_t* base = task.raw->data();
-        const uint8_t* srcY = base;
-        const uint8_t* srcU = base + y_size;
-        const uint8_t* srcV = base + y_size + u_size;
-
-        // dst_yuv is padded; copy row-by-row into padded buffers
-        copy_plane_tight_to_padded(dst_yuv->data[0], dst_yuv->linesize[0], srcY, w,  w,  h);
-        copy_plane_tight_to_padded(dst_yuv->data[1], dst_yuv->linesize[1], srcU, w2, w2, h2);
-        copy_plane_tight_to_padded(dst_yuv->data[2], dst_yuv->linesize[2], srcV, w2, w2, h2);
-
-        // Encode to JPEG
-        AVPacket* pkt = av_packet_alloc();
-        int ret = avcodec_send_frame(mjpeg_encoder_ctxs_[thread_id], dst_yuv);
-        if (ret >= 0) {
-            ret = avcodec_receive_packet(mjpeg_encoder_ctxs_[thread_id], pkt);
-            if (ret >= 0) {
-                jpeg_buffer.assign(pkt->data, pkt->data + pkt->size);
-                av_packet_free(&pkt);
-                return true;
-            }
-        }
-        av_packet_free(&pkt);
-        return false;
-    }
-
-    // Fallback path: use sws to convert into dst_yuv (FFmpeg producer or size mismatch)
+    // If needed, allocate a scaler from src format → YUVJ420P (no-op if already 420)
     if (!sws_contexts_[thread_id]) {
         sws_contexts_[thread_id] = sws_getContext(
-            dst_yuv->width, dst_yuv->height, AV_PIX_FMT_YUV420P,
-            dst_yuv->width, dst_yuv->height, AV_PIX_FMT_YUV420P,
+            task.frame->width, task.frame->height, static_cast<AVPixelFormat>(task.frame->format),
+            yuv_frame->width,  yuv_frame->height,  AV_PIX_FMT_YUVJ420P,
             SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
         if (!sws_contexts_[thread_id]) {
             std::cerr << "Error: Failed to create scaler context for thread " << thread_id << std::endl;
             return false;
         }
+        // full-range
         av_opt_set_int(sws_contexts_[thread_id], "src_range", 1, 0);
         av_opt_set_int(sws_contexts_[thread_id], "dst_range", 1, 0);
     }
 
-    // Build a source AVFrame depending on the producer path
-    AVFrame src{};
-    std::memset(&src, 0, sizeof(src));
-
-    if (task.frame) {
-        // FFmpeg decode path
-        src.format = task.frame->format;
-        src.width  = task.frame->width;
-        src.height = task.frame->height;
-        for (int i = 0; i < 8; ++i) {
-            src.data[i] = task.frame->data[i];
-            src.linesize[i] = task.frame->linesize[i];
-        }
-    } else if (task.raw) {
-        // Jetson but size mismatch: still I420
-        const int w = task.width;
-        const int h = task.height;
-        const size_t y_size = static_cast<size_t>(w) * h;
-        const size_t uv_size = (static_cast<size_t>(w) / 2) * (h / 2);
-
-        src.format = AV_PIX_FMT_YUV420P;
-        src.width  = w;
-        src.height = h;
-
-        uint8_t* base = task.raw->data();
-        src.data[0] = base;
-        src.data[1] = base + y_size;
-        src.data[2] = base + y_size + uv_size;
-
-        src.linesize[0] = w;
-        src.linesize[1] = w / 2;
-        src.linesize[2] = w / 2;
-    } else {
-        return false;
-    }
-
-    const uint8_t* src_slices[4] = { src.data[0], src.data[1], src.data[2], src.data[3] };
-    int src_strides[4] = { src.linesize[0], src.linesize[1], src.linesize[2], src.linesize[3] };
-
     sws_scale(sws_contexts_[thread_id],
-              src_slices, src_strides, 0, src.height,
-              dst_yuv->data, dst_yuv->linesize);
+              task.frame->data, task.frame->linesize, 0, task.frame->height,
+              yuv_frame->data, yuv_frame->linesize);
 
     AVPacket* pkt = av_packet_alloc();
-    int ret = avcodec_send_frame(mjpeg_encoder_ctxs_[thread_id], dst_yuv);
+    int ret = avcodec_send_frame(mjpeg_encoder_ctxs_[thread_id], yuv_frame);
     if (ret >= 0) {
         ret = avcodec_receive_packet(mjpeg_encoder_ctxs_[thread_id], pkt);
         if (ret >= 0) {
@@ -655,17 +557,16 @@ bool VideoPlaybackCamera::transfer_hw_frame_to_sw(AVFrame* src, AVFrame* dst) {
 }
 
 vs::Camera::raw_image VideoPlaybackCamera::get_image(std::string /*mime_type*/,
-                                                    const vs::ProtoStruct& /*extra*/) {
+                                                     const vs::ProtoStruct& /*extra*/) {
     std::unique_lock<std::mutex> lock(jpeg_mutex_);
 
-#if defined(USE_NVDEC)
-    // Wait up to 500ms for a fresh frame. If we have a recent one (<1s), return it.
+    // Wait up to 500ms for a fresh frame; otherwise return last known if recent
     auto now = std::chrono::steady_clock::now();
     if (is_jpeg_ready_) {
         auto age = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_frame_time_);
         if (age < std::chrono::seconds(1)) {
             vs::Camera::raw_image img;
-            img.bytes = latest_jpeg_buffer_;
+            img.bytes     = latest_jpeg_buffer_;
             img.mime_type = "image/jpeg";
             return img;
         }
@@ -673,22 +574,15 @@ vs::Camera::raw_image VideoPlaybackCamera::get_image(std::string /*mime_type*/,
     if (!jpeg_ready_cv_.wait_for(lock, std::chrono::milliseconds(500), [this]{ return is_jpeg_ready_; })) {
         if (!latest_jpeg_buffer_.empty()) {
             vs::Camera::raw_image img;
-            img.bytes = latest_jpeg_buffer_;
+            img.bytes     = latest_jpeg_buffer_;
             img.mime_type = "image/jpeg";
             return img;
         }
         throw vs::Exception("Timeout waiting for frame from stream");
     }
-#else
-    if (!jpeg_ready_cv_.wait_for(lock, std::chrono::milliseconds(200),
-                                 [this]{ return is_jpeg_ready_; })) {
-        throw vs::Exception("Timeout waiting for frame from stream");
-    }
-    is_jpeg_ready_ = false; // FFmpeg path consumes frames
-#endif
 
     vs::Camera::raw_image img;
-    img.bytes = latest_jpeg_buffer_;
+    img.bytes     = latest_jpeg_buffer_;
     img.mime_type = "image/jpeg";
     return img;
 }
@@ -698,7 +592,7 @@ vs::Camera::image_collection VideoPlaybackCamera::get_images() {
 }
 
 vs::Camera::point_cloud VideoPlaybackCamera::get_point_cloud(std::string /*mime_type*/,
-                                                            const vs::ProtoStruct& /*extra*/) {
+                                                             const vs::ProtoStruct& /*extra*/) {
     throw vs::Exception("get_point_cloud is not implemented for this camera");
 }
 
@@ -714,16 +608,13 @@ vs::Camera::properties VideoPlaybackCamera::get_properties() {
         if (w > 0 && h > 0) {
             props.intrinsic_parameters.width_px  = w;
             props.intrinsic_parameters.height_px = h;
-        } else if (output_width_ > 0 && output_height_ > 0) {
-            props.intrinsic_parameters.width_px  = output_width_;
-            props.intrinsic_parameters.height_px = output_height_;
         } else {
-            props.intrinsic_parameters.width_px  = 1920;
-            props.intrinsic_parameters.height_px = 1080;
+            props.intrinsic_parameters.width_px  = (output_width_  > 0 ? output_width_  : 1920);
+            props.intrinsic_parameters.height_px = (output_height_ > 0 ? output_height_ : 1080);
         }
     } else {
-        props.intrinsic_parameters.width_px  = (output_width_>0?output_width_:1920);
-        props.intrinsic_parameters.height_px = (output_height_>0?output_height_:1080);
+        props.intrinsic_parameters.width_px  = (output_width_  > 0 ? output_width_  : 1920);
+        props.intrinsic_parameters.height_px = (output_height_ > 0 ? output_height_ : 1080);
     }
 #else
     if (decoder_ctx_) {
@@ -741,21 +632,25 @@ vs::ProtoStruct VideoPlaybackCamera::do_command(const vs::ProtoStruct& command) 
     }
 
     vs::ProtoStruct results;
-    results["frames_decoded"] = vs::ProtoValue(static_cast<int>(frames_decoded_.load()));
-    results["frames_encoded"] = vs::ProtoValue(static_cast<int>(frames_encoded_.load()));
+    results["frames_decoded"]          = vs::ProtoValue(static_cast<int>(frames_decoded_.load()));
+    results["frames_encoded"]          = vs::ProtoValue(static_cast<int>(frames_encoded_.load()));
     results["frames_dropped_producer"] = vs::ProtoValue(static_cast<int>(frames_dropped_producer_.load()));
     results["frames_dropped_consumer"] = vs::ProtoValue(static_cast<int>(frames_dropped_consumer_.load()));
+    results["encoder_queue_size"]      = vs::ProtoValue(static_cast<int>(frame_queue_.size()));
+    results["encoder_threads"]         = vs::ProtoValue(num_encoder_threads_);
 
 #if defined(USE_NVDEC)
-    results["pipeline_type"]      = vs::ProtoValue("GStreamer I420 → FFmpeg MJPEG");
-    results["encoder_queue_size"] = vs::ProtoValue(static_cast<int>(frame_queue_.size()));
-    results["encoder_threads"]    = vs::ProtoValue(num_encoder_threads_);
-    results["scaled_width"]       = vs::ProtoValue(output_width_);
-    results["scaled_height"]      = vs::ProtoValue(output_height_);
+    results["pipeline_type"] = vs::ProtoValue(std::string("GStreamer I420 → FFmpeg MJPEG"));
+    // best effort scaled dims (actual caps detected in gst)
+    int scaled_w = (output_width_  > 0 ? output_width_  : (gst_pipeline_ ? gst_pipeline_->width()  : 0));
+    int scaled_h = (output_height_ > 0 ? output_height_ : (gst_pipeline_ ? gst_pipeline_->height() : 0));
+    if (scaled_w <= 0 || scaled_h <= 0) {
+        scaled_w = 1920; scaled_h = 1080;
+    }
+    results["scaled_width"]  = vs::ProtoValue(scaled_w);
+    results["scaled_height"] = vs::ProtoValue(scaled_h);
 #else
-    results["pipeline_type"]      = vs::ProtoValue("FFmpeg/Software");
-    results["encoder_queue_size"] = vs::ProtoValue(static_cast<int>(frame_queue_.size()));
-    results["encoder_threads"]    = vs::ProtoValue(num_encoder_threads_);
+    results["pipeline_type"] = vs::ProtoValue("FFmpeg/Software");
 #endif
 
     auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(
