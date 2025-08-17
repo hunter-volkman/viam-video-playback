@@ -14,19 +14,18 @@
 /**
  * GStreamer Pipeline Wrapper for Hardware-Accelerated Video Playback (Jetson)
  *
- * Primary pipeline:
- *   filesrc → qtdemux → queue → h264parse → nvv4l2decoder → nvvidconv → (nvjpegenc|jpegenc) → appsink
+ * Decode-only pipeline (NO in-process JPEG encoding):
+ *   filesrc → qtdemux → queue → h264parse → nvv4l2decoder → nvvidconv → video/x-raw,format=I420 → appsink
  *
  * Looping Strategy:
  *   1) Try post-EOS seek (pause → seek-to-0 (flush|key-unit) → play)
  *   2) Fallback to full pipeline restart with strict teardown ordering
- *
- * JPEG Encode:
- *   - Prefer nvjpegenc (GPU). If unavailable, fall back to jpegenc (CPU).
  */
 class GstPipelineWrapper {
 public:
-    using FrameCallback = std::function<void(const uint8_t*, size_t)>;
+    // I420 raw frame callback: data is a single contiguous I420 buffer (Y plane, U plane, V plane)
+    // with tight packing (stride == width). size == width*height + (width/2)*(height/2)*2.
+    using FrameCallback = std::function<void(const uint8_t* data, size_t size, int width, int height)>;
 
     GstPipelineWrapper();
     ~GstPipelineWrapper();
@@ -36,9 +35,9 @@ public:
     GstPipelineWrapper& operator=(const GstPipelineWrapper&) = delete;
 
     /**
-     * Start the GStreamer pipeline for a video file
+     * Start the GStreamer pipeline for a video file (decode-only).
      * @param file_path Path to the video file
-     * @param cb Callback function to receive JPEG frames
+     * @param cb Callback function to receive I420 frames (contiguous, tight stride)
      * @param loop Enable looping playback
      * @param max_buffers Maximum buffers in appsink queue
      * @return true if pipeline started successfully
@@ -54,9 +53,6 @@ public:
 
     /** Frames processed so far (cumulative across loops). */
     uint64_t frames_processed() const { return frames_processed_; }
-
-    /** Report last chosen JPEG encoder ("nvjpegenc" or "jpegenc"). */
-    std::string encoder_name() const { return encoder_name_; }
 
     /** Output dimensions (best-effort; populated from first sample caps). */
     int width()  const { return width_; }
@@ -74,7 +70,6 @@ private:
     std::atomic<uint64_t> frames_processed_{0};
     bool                  loop_enabled_ = true;
     std::string           file_path_;
-    std::string           encoder_name_ = "jpegenc"; // set at runtime
     int                   width_  = 0;
     int                   height_ = 0;
 
@@ -82,12 +77,10 @@ private:
     std::mutex            lifecycle_mtx_;
 
     // Internal helpers
-    bool build_and_start_pipeline(const std::string& encoder, int max_buffers, std::string* err_out);
+    bool build_and_start_pipeline(int max_buffers, std::string* err_out);
     void cleanup_pipeline();     // blocking NULL + unref + remove bus watch
     bool restart_pipeline();     // safe blocking restart
-    static std::string make_pipeline_str(const std::string& file_path,
-                                         const std::string& encoder,
-                                         int max_buffers);
+    static std::string make_pipeline_str(const std::string& file_path, int max_buffers);
 
     // GStreamer callbacks
     static GstFlowReturn on_new_sample(GstAppSink* sink, gpointer user_data);

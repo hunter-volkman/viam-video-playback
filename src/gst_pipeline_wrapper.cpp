@@ -1,22 +1,21 @@
 #include "gst_pipeline_wrapper.hpp"
 #include <iostream>
 #include <sstream>
+#include <vector>
+#include <cstring>
 
 GstPipelineWrapper::GstPipelineWrapper() {
     // Safe to call multiple times; GStreamer ignores redundant init
     gst_init(nullptr, nullptr);
-    std::cout << "GStreamer initialized." << std::endl;
+    std::cout << "GStreamer initialized (decode-only pipeline)." << std::endl;
 }
 
 GstPipelineWrapper::~GstPipelineWrapper() {
     stop();
 }
 
-std::string GstPipelineWrapper::make_pipeline_str(const std::string& file_path,
-                                                  const std::string& encoder,
-                                                  int max_buffers) {
-    // NOTE: We explicitly use h264parse + nvv4l2decoder for hardware decode on Jetson.
-    // If you need H.265, wire an alternative builder or detect codec upstream.
+std::string GstPipelineWrapper::make_pipeline_str(const std::string& file_path, int max_buffers) {
+    // Decode-only pipeline with tight I420 output. We request tight packing (default for nvvidconv I420).
     std::stringstream ss;
     ss << "filesrc location=\"" << file_path << "\" ! ";
     ss << "qtdemux name=demux ";
@@ -24,17 +23,14 @@ std::string GstPipelineWrapper::make_pipeline_str(const std::string& file_path,
     ss << "h264parse config-interval=-1 ! ";
     ss << "nvv4l2decoder enable-max-performance=1 ! ";
     ss << "nvvidconv ! video/x-raw,format=I420 ! ";
-    ss << encoder << " quality=85 ! ";
     ss << "appsink name=mysink emit-signals=true ";
     ss << "max-buffers=" << max_buffers << " drop=true sync=false";
     return ss.str();
 }
 
-bool GstPipelineWrapper::build_and_start_pipeline(const std::string& encoder, int max_buffers, std::string* err_out) {
-    encoder_name_ = encoder;
-
+bool GstPipelineWrapper::build_and_start_pipeline(int max_buffers, std::string* err_out) {
     // Build pipeline
-    std::string pipeline_str = make_pipeline_str(file_path_, encoder, max_buffers);
+    std::string pipeline_str = make_pipeline_str(file_path_, max_buffers);
     std::cout << "Creating GStreamer pipeline: " << pipeline_str << std::endl;
 
     GError* err = nullptr;
@@ -90,8 +86,8 @@ bool GstPipelineWrapper::build_and_start_pipeline(const std::string& encoder, in
     }
 
     running_.store(true);
-    std::cout << "✓ GStreamer pipeline started successfully" << std::endl;
-    std::cout << "  Using: nvv4l2decoder (hardware) → " << encoder_name_ << " → appsink" << std::endl;
+    std::cout << "✓ GStreamer decode-only pipeline started successfully" << std::endl;
+    std::cout << "  Using: nvv4l2decoder (hardware) → nvvidconv (I420) → appsink" << std::endl;
     std::cout << "  Loop enabled: " << (loop_enabled_ ? "yes" : "no") << std::endl;
     return true;
 }
@@ -108,15 +104,10 @@ bool GstPipelineWrapper::start(const std::string& file_path, FrameCallback cb, b
     frames_processed_ = 0;
     width_ = height_ = 0;
 
-    // Prefer nvjpegenc; if missing, fall back to jpegenc.
     std::string err;
-    if (!build_and_start_pipeline("nvjpegenc", max_buffers, &err)) {
-        std::cerr << "nvjpegenc path failed (" << err << "), falling back to jpegenc..." << std::endl;
-        err.clear();
-        if (!build_and_start_pipeline("jpegenc", max_buffers, &err)) {
-            std::cerr << "jpegenc path also failed: " << err << std::endl;
-            return false;
-        }
+    if (!build_and_start_pipeline(max_buffers, &err)) {
+        std::cerr << "Pipeline start failed: " << err << std::endl;
+        return false;
     }
     return true;
 }
@@ -136,12 +127,10 @@ void GstPipelineWrapper::cleanup_pipeline() {
         bus_watch_id_ = 0;
     }
 
-    // Drain EOS/error and drive to NULL
+    // Drive to NULL
     if (pipeline_) {
-        // Set to NULL and block for completion to ensure NVDEC fully releases
         gst_element_set_state(pipeline_, GST_STATE_NULL);
         GstState cur = GST_STATE_NULL, pending = GST_STATE_NULL;
-        // Wait up to 1s for state change to complete
         gst_element_get_state(pipeline_, &cur, &pending, 1 * GST_SECOND);
     }
 
@@ -157,29 +146,22 @@ void GstPipelineWrapper::cleanup_pipeline() {
 
 bool GstPipelineWrapper::restart_pipeline() {
     // Restart with same params (safe teardown + re-build)
-    std::cout << "Restarting pipeline for loop..." << std::endl;
+    std::cout << "Restarting decode-only pipeline for loop..." << std::endl;
     cleanup_pipeline();
 
     // Small delay to ensure NVDEC userspace driver is fully torn down
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
     std::string err;
-    if (!build_and_start_pipeline(encoder_name_, /*max_buffers=*/8, &err)) {
-        // If our previously chosen encoder fails (e.g., nvjpegenc disappeared), try the other one.
-        std::cerr << "Primary restart failed (" << err << "). Trying alternate encoder..." << std::endl;
-        const std::string alt = (encoder_name_ == "nvjpegenc") ? "jpegenc" : "nvjpegenc";
-        err.clear();
-        if (!build_and_start_pipeline(alt, /*max_buffers=*/8, &err)) {
-            std::cerr << "Alternate restart also failed: " << err << std::endl;
-            running_.store(false);
-            return false;
-        }
+    if (!build_and_start_pipeline(/*max_buffers=*/8, &err)) {
+        std::cerr << "Restart failed: " << err << std::endl;
+        running_.store(false);
+        return false;
     }
     return true;
 }
 
 bool GstPipelineWrapper::try_seek_to_start() {
-    // Some demuxers behave better if we pause before seeking
     if (!pipeline_) return false;
 
     // Pause
@@ -269,16 +251,9 @@ GstFlowReturn GstPipelineWrapper::on_new_sample(GstAppSink* sink, gpointer user_
 
     GstMapInfo info;
     if (gst_buffer_map(buf, &info, GST_MAP_READ)) {
-        // Log first few and then periodic frames
-        if (self->frames_processed_ < 5) {
-            std::cout << "Frame " << (self->frames_processed_ + 1)
-                      << " - JPEG size: " << info.size << " bytes" << std::endl;
-        } else if ((self->frames_processed_ % 100) == 0) {
-            std::cout << "Processed " << self->frames_processed_ << " frames" << std::endl;
-        }
-
+        // Expect tight I420 packing
         try {
-            self->frame_cb_(static_cast<const uint8_t*>(info.data), info.size);
+            self->frame_cb_(static_cast<const uint8_t*>(info.data), info.size, self->width_, self->height_);
             self->frames_processed_++;
         } catch (const std::exception& ex) {
             std::cerr << "Frame callback threw exception: " << ex.what() << std::endl;
