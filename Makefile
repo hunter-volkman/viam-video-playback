@@ -69,7 +69,7 @@ debug: check-env
 	@$(MAKE) -C $(BUILD_DIR) -j$(shell $(NPROC_CMD))
 	@echo "Debug build complete: $(BUILD_DIR)/$(MODULE_NAME)"
 
-# Create distribution package - simplified version
+# Create distribution package
 dist: build
 	@echo "Creating distribution package..."
 	@mkdir -p $(INSTALL_DIR)/bin
@@ -81,7 +81,7 @@ dist: build
 	@chmod +x $(INSTALL_DIR)/run.sh
 	@cp meta.json $(INSTALL_DIR)/
 	
-	# Simple library bundling for macOS
+	# Platform-specific library bundling
 ifeq ($(UNAME_S),Darwin)
 	@echo "Bundling core libraries for macOS..."
 	# Copy Viam SDK library
@@ -92,17 +92,36 @@ ifeq ($(UNAME_S),Darwin)
 	fi
 	# Update library paths
 	@install_name_tool -add_rpath @loader_path/../lib $(INSTALL_DIR)/bin/$(MODULE_NAME) 2>/dev/null || true
+else ifeq ($(UNAME_S),Linux)
+	@echo "Bundling core libraries for Linux..."
+	# Copy all Viam SDK libraries and create symlinks
+	@cp $(VIAM_CPP_SDK_HOME)/lib/libviamsdk.so* $(INSTALL_DIR)/lib/ 2>/dev/null || true
+	@cp $(VIAM_CPP_SDK_HOME)/lib/libviamapi.so* $(INSTALL_DIR)/lib/ 2>/dev/null || true
+	# Create necessary symlinks
+	@cd $(INSTALL_DIR)/lib && \
+		if [ -f libviamsdk.so.0.17.0 ]; then \
+			ln -sf libviamsdk.so.0.17.0 libviamsdk.so.noabi; \
+			ln -sf libviamsdk.so.0.17.0 libviamsdk.so; \
+		fi
+	# Also check for libviamapi symlinks if needed
+	@cd $(INSTALL_DIR)/lib && \
+		if [ -f libviamapi.so.0.17.0 ]; then \
+			ln -sf libviamapi.so.0.17.0 libviamapi.so; \
+		fi
 endif
 	
 	# Create archive
 	@cd $(INSTALL_DIR) && tar -czf ../../$(ARCHIVE_NAME) .
 	@echo "Distribution package created: $(ARCHIVE_NAME)"
 	@echo "Package size: $$(du -h $(ARCHIVE_NAME) | cut -f1)"
+	@echo ""
+	@echo "Archive contents:"
+	@tar -tzf $(ARCHIVE_NAME) | head -20
 
 # Clean build artifacts
 clean:
 	@echo "Cleaning build artifacts..."
-	@rm -rf $(BUILD_DIR) $(ARCHIVE_NAME) bin/
+	@rm -rf $(BUILD_DIR) $(ARCHIVE_NAME) bin/ lib/
 	@echo "Clean complete"
 
 # Install locally for testing
