@@ -26,7 +26,7 @@ The following attributes are available for this model:
 | `target_fps` | integer | Optional  |  Target frame rate (0 = source FPS). Defaults to 0. |
 | `jpeg_quality_level` | integer | Optional  | JPEG quality 2-31 (lower = better quality). Defaults to 15. |
 | `max_resolution` | integer | Optional  | Max width/height (0 = no scaling). Defaults to 0. |
-| `use_hardware_acceleration` | boolean | Optional  | Enable hardware acceleration (Jetson NVDEC). Defaults to `false`. |
+| `use_hardware_acceleration` | boolean | Optional  | Enable hardware acceleration (e.g., Jetson NVDEC). Defaults to `false`. |
 
 #### Example Configuration
 
