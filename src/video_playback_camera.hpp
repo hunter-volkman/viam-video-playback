@@ -86,7 +86,7 @@ private:
     int target_fps_ = 0;
     int quality_level_ = 15;
     int max_resolution_ = 0;  // New: max resolution for downscaling
-    bool use_hardware_accel_ = false;  // New: hardware acceleration flag
+    bool use_hardware_acceleration = false;  // New: hardware acceleration flag
     
     // Output dimensions (may differ from source)
     int output_width_ = 0;

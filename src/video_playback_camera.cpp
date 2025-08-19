@@ -86,8 +86,8 @@ void VideoPlaybackCamera::reconfigure(
     }
     
     // New: hardware acceleration toggle
-    if (attrs.find("use_hardware_accel") != attrs.end()) {
-        use_hardware_accel_ = *attrs.at("use_hardware_accel").get<bool>();
+    if (attrs.find("use_hardware_acceleration") != attrs.end()) {
+        use_hardware_acceleration_ = *attrs.at("use_hardware_acceleration").get<bool>();
     }
     
     std::cout << "Configuration:" << std::endl;
@@ -96,7 +96,7 @@ void VideoPlaybackCamera::reconfigure(
     std::cout << "  Target FPS: " << (target_fps_ > 0 ? std::to_string(target_fps_) : "source") << std::endl;
     std::cout << "  JPEG Quality: " << quality_level_ << std::endl;
     std::cout << "  Max Resolution: " << (max_resolution_ > 0 ? std::to_string(max_resolution_) : "source") << std::endl;
-    std::cout << "  Hardware Accel: " << (use_hardware_accel_ ? "yes" : "no") << std::endl;
+    std::cout << "  Hardware Accel: " << (use_hardware_acceleration_ ? "yes" : "no") << std::endl;
     
     // Initialize decoder
     if (!initialize_decoder(video_path_)) {
@@ -167,7 +167,7 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
     decoder_ = nullptr;
     
     // Try to use hardware decoder if requested
-    if (use_hardware_accel_) {
+    if (use_hardware_acceleration_) {
 #ifdef USE_NVDEC
         // On Jetson, try NVIDIA hardware decoders
         if (video_stream->codecpar->codec_id == AV_CODEC_ID_H264) {
@@ -252,7 +252,7 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
         std::cerr << "Error: Failed to open decoder: " << errbuf << std::endl;
         
         // If hardware decoder failed, try falling back to software
-        if (use_hardware_accel_) {
+        if (use_hardware_acceleration_) {
             std::cout << "Hardware decoder failed, falling back to software decoder" << std::endl;
             avcodec_free_context(&decoder_ctx_);
             
@@ -695,7 +695,7 @@ vs::ProtoStruct VideoPlaybackCamera::do_command(const vs::ProtoStruct& command) 
         stats["encoder_threads"] = vs::ProtoValue(num_encoder_threads_);
         stats["output_width"] = vs::ProtoValue(output_width_);
         stats["output_height"] = vs::ProtoValue(output_height_);
-        stats["hardware_accel"] = vs::ProtoValue(use_hardware_accel_);
+        stats["hardware_accel"] = vs::ProtoValue(use_hardware_acceleration_);
         stats["decoder_name"] = vs::ProtoValue(std::string(decoder_ ? decoder_->name : "unknown"));
         
         return stats;
