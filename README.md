@@ -25,7 +25,7 @@ The following attributes are available for this model:
 | `loop` | boolean | Optional  | Loop video playback. Defaults to `true`. |
 | `target_fps` | integer | Optional  |  Target frame rate (0 = source FPS). Defaults to 0. |
 | `jpeg_quality_level` | integer | Optional  | JPEG quality 2-31 (lower = better quality). Defaults to 15. |
-| `max_resolution` | integer | Optional  | Maximum width/height (0 = no scaling). Defaults to 0. |
+| `max_resolution` | integer | Optional  | Max width/height (0 = no scaling). Defaults to 0. |
 | `use_hardware_acceleration` | boolean | Optional  | Enable hardware acceleration (e.g., Jetson NVDEC). Defaults to `false`. |
 
 #### Example Configuration
