@@ -46,7 +46,7 @@ public:
     
     viam::sdk::Camera::properties get_properties() override;
     
-    // Reconfigurable interface
+    // Reconfigure
     void reconfigure(const viam::sdk::Dependencies& deps, 
                     const viam::sdk::ResourceConfig& cfg) override;
     

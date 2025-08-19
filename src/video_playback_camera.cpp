@@ -694,7 +694,7 @@ vs::ProtoStruct VideoPlaybackCamera::do_command(const vs::ProtoStruct& command) 
         stats["encoder_threads"] = vs::ProtoValue(num_encoder_threads_);
         stats["output_width"] = vs::ProtoValue(output_width_);
         stats["output_height"] = vs::ProtoValue(output_height_);
-        stats["hardware_accel"] = vs::ProtoValue(use_hardware_acceleration_);
+        stats["hardware_acceleration"] = vs::ProtoValue(use_hardware_acceleration_);
         stats["decoder_name"] = vs::ProtoValue(std::string(decoder_ ? decoder_->name : "unknown"));
         
         return stats;
