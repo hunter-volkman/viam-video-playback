@@ -85,8 +85,8 @@ private:
     bool loop_playback_ = true;
     int target_fps_ = 0;
     int quality_level_ = 15;
-    int max_resolution_ = 0;  // New: max resolution for downscaling
-    bool use_hardware_acceleration = false;  // New: hardware acceleration flag
+    int max_resolution_ = 0;
+    bool use_hardware_acceleration_ = false; 
     
     // Output dimensions (may differ from source)
     int output_width_ = 0;
