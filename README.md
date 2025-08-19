@@ -2,7 +2,7 @@
 A Viam `camera` component for local video file playback with hardware acceleration support.
 
 ## Model `hunter:video-playback:camera`
-This model implements the `rdk:component:camera` API by decoding and streaming video files at consistent FPS for testing vision services with repeatable input.
+This model implements the `rdk:component:camera` API by decoding and streaming video files at consistent FPS for testing ML vision services with repeatable input.
 
 ### Configuration
 
