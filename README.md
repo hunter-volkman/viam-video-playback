@@ -1,8 +1,8 @@
 # Video Playback Module
-A Viam camera component for local video file playback with high-performance hardware acceleration support.
+A Viam `camera` component for local video file playback with hardware acceleration support.
 
 ## Model `hunter:video-playback:camera`
-This model implements the rdk:component:camera API by decoding and streaming video files at consistent frame rates for testing vision services with repeatable input.
+This model implements the `rdk:component:camera` API by decoding and streaming video files at consistent frame rates for testing vision services with repeatable input.
 
 ### Configuration
 
