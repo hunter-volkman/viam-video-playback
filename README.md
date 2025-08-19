@@ -8,27 +8,28 @@ This model implements the `rdk:component:camera` API by decoding and streaming a
 
 ```json
 {
-  "video_path": "/Users/hunter.volkman/Developer/viam-video-playback/test-videos/15099728-uhd_3840_2160_25fps.mp4",
+  "video_path": "path/to/video.mp4",
   "loop": true,
-  "target_fps": 25
+  "target_fps": 25,
+  "jpeg_quality_level": 20,
+  "max_resolution": 1920,
+  "use_hardware_acceleration": true
 }
 ```
 
-#### Required Attributes
+#### Attributes
 
-| Name | Type | Description |
-|------|------|-----------|
-| `video_path` | string | The absolute file path to the video file to be streamed |
+The following attributes are available for this model:
 
-#### Optional Attributes
+| Name          | Type   | Inclusion | Description                |
+|---------------|--------|-----------|----------------------------|
+| `video_path` | string  | Required  | The absolute file path to the video file to be streamed (e.g., "/home/user/videos/test.mp4"). |
+| `loop` | boolean | Optional  | Loop video playback. Defaults to `true`. |
+| `target_fps` | integer | Optional  |  Target frame rate (0 = source FPS). Defaults to 0. |
+| `jpeg_quality_level` | integer | Optional  | JPEG quality 2-31 (lower = better quality). Defaults to 15. |
+| `max_resolution` | integer | Optional  | Max width/height (0 = no scaling). Defaults to 0. |
+| `use_hardware_acceleration` | boolean | Optional  | Enable hardware decoder. Defaults to `false`. |
 
-| Name | Type | Default | Description |
-|------|------|-----------|-------------|
-| `loop` | boolean | true | Automatically loop the video when it ends |
-| `target_fps` | integer | Source FPS | Desired frame rate for the stream |
-| `jpeg_quality_level` | integer | 15 | JPEG quality from 1 (best) to 31 (fastest) |
-| `output_width` | integer | Source width | Width in pixels to resize the output stream to |
-| `output_height` | integer | Source height | Height in pixels to resize the output stream to |
 
 
 ### DoCommand
