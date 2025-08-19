@@ -88,7 +88,7 @@ private:
     int max_resolution_ = 0;
     bool use_hardware_acceleration_ = false; 
     
-    // Output dimensions (may differ from source)
+    // Output dimensions
     int output_width_ = 0;
     int output_height_ = 0;
     

@@ -81,12 +81,10 @@ void VideoPlaybackCamera::reconfigure(
             2, 31);
     }
     
-    // New: max_resolution for downscaling
     if (attrs.find("max_resolution") != attrs.end()) {
         max_resolution_ = static_cast<int>(*attrs.at("max_resolution").get<double>());
     }
     
-    // New: hardware acceleration toggle
     if (attrs.find("use_hardware_acceleration") != attrs.end()) {
         use_hardware_acceleration_ = *attrs.at("use_hardware_acceleration").get<bool>();
     }
@@ -97,7 +95,7 @@ void VideoPlaybackCamera::reconfigure(
     std::cout << "  Target FPS: " << (target_fps_ > 0 ? std::to_string(target_fps_) : "source") << std::endl;
     std::cout << "  JPEG Quality: " << quality_level_ << std::endl;
     std::cout << "  Max Resolution: " << (max_resolution_ > 0 ? std::to_string(max_resolution_) : "source") << std::endl;
-    std::cout << "  Hardware Accel: " << (use_hardware_acceleration_ ? "yes" : "no") << std::endl;
+    std::cout << "  Hardware Acceleration: " << (use_hardware_acceleration_ ? "yes" : "no") << std::endl;
     
     // Initialize decoder
     if (!initialize_decoder(video_path_)) {
@@ -337,7 +335,7 @@ bool VideoPlaybackCamera::initialize_encoder_pool(int width, int height) {
         ctx->height = height;
         ctx->time_base = AVRational{1, static_cast<int>(source_fps_)};
         
-        // Set quality - use lower quality for higher resolutions
+        // Set quality, use lower quality for higher resolutions
         int adjusted_quality = quality_level_;
         if (width > 2560 || height > 1440) {
             // For 4K, increase quality value (lower quality) for better performance
@@ -365,7 +363,7 @@ bool VideoPlaybackCamera::initialize_encoder_pool(int width, int height) {
             return false;
         }
         
-        // Create scaler - handles both color conversion and scaling
+        // Create scaler, handles both color conversion and scaling
         bool needs_scaling = (width != decoder_ctx_->width || height != decoder_ctx_->height);
         bool needs_conversion = (decoder_ctx_->pix_fmt != AV_PIX_FMT_YUVJ420P);
         
