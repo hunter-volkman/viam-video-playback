@@ -108,6 +108,18 @@ else ifeq ($(UNAME_S),Linux)
 		if [ -f libviamapi.so.0.17.0 ]; then \
 			ln -sf libviamapi.so.0.17.0 libviamapi.so; \
 		fi
+
+	# Bundle FFmpeg libraries
+	@echo "Bundling FFmpeg libraries..."
+	@for lib in avformat avcodec avutil swscale swresample avfilter; do \
+		find /usr/lib /usr/local/lib -name "lib$$lib.so*" 2>/dev/null | head -1 | xargs -I {} cp {} $(INSTALL_DIR)/lib/ 2>/dev/null || true; \
+	done
+
+	# Bundle gRPC and protobuf libraries
+	@echo "Bundling gRPC and protobuf libraries..."
+	@for lib in grpc++ grpc++_reflection protobuf; do \
+		find /usr/lib /usr/local/lib -name "lib$$lib.so*" 2>/dev/null | head -1 | xargs -I {} cp {} $(INSTALL_DIR)/lib/ 2>/dev/null || true; \
+	done
 endif
 	
 	# Create archive
