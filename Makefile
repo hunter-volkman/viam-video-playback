@@ -81,7 +81,7 @@ dist: build
 	@chmod +x $(INSTALL_DIR)/run.sh
 	@cp meta.json $(INSTALL_DIR)/
 	
-	# Platform-specific library bundling
+# Platform-specific library bundling
 ifeq ($(UNAME_S),Darwin)
 	@echo "Bundling core libraries for macOS..."
 	# Copy Viam SDK library
@@ -108,17 +108,21 @@ else ifeq ($(UNAME_S),Linux)
 		if [ -f libviamapi.so.0.17.0 ]; then \
 			ln -sf libviamapi.so.0.17.0 libviamapi.so; \
 		fi
-
-	# Bundle FFmpeg libraries
+	
+	# Bundle FFmpeg libraries (copy actual files)
 	@echo "Bundling FFmpeg libraries..."
 	@for lib in avformat avcodec avutil swscale swresample avfilter; do \
-		find /usr/lib /usr/local/lib -name "lib$$lib.so*" 2>/dev/null | head -1 | xargs -I {} cp {} $(INSTALL_DIR)/lib/ 2>/dev/null || true; \
+		find /usr/lib /usr/local/lib -name "lib$$lib.so.*" -type f 2>/dev/null | while read file; do \
+			cp -L "$$file" $(INSTALL_DIR)/lib/ 2>/dev/null || true; \
+		done; \
 	done
-
-	# Bundle gRPC and protobuf libraries
+	
+	# Bundle gRPC and protobuf libraries (copy actual files)
 	@echo "Bundling gRPC and protobuf libraries..."
 	@for lib in grpc++ grpc++_reflection protobuf; do \
-		find /usr/lib /usr/local/lib -name "lib$$lib.so*" 2>/dev/null | head -1 | xargs -I {} cp {} $(INSTALL_DIR)/lib/ 2>/dev/null || true; \
+		find /usr/lib /usr/local/lib -name "lib$$lib.so.*" -type f 2>/dev/null | while read file; do \
+			cp -L "$$file" $(INSTALL_DIR)/lib/ 2>/dev/null || true; \
+		done; \
 	done
 endif
 	
