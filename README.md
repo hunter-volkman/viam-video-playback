@@ -64,11 +64,18 @@ Check the real-time performance and status of the video playback pipeline.
   "frames_dropped_consumer": 0,
   "encoder_queue_size": 0,
   "actual_fps": 25.049261083743843,
-  "decoder_name": "h264_nvv4l2dec",
-  "hardware_accel": true
+  "decoder_name": "h264",
+  "hardware_acceleration": true,
+  "output_width": 1920,
+  "output_height": 1080
 }
 ```
 
 ### Supported Platforms
 * **macOS** (Apple Silicon): Software decoding with multi-threading
-* **Jetson** (ARM64): Hardware H.264 decoding with NVIDIA NVDEC
+* **Jetson** (ARM64): Hardware H.264/HEVC decoding with NVIDIA NVDEC (falls back to software if hardware unavailable)
+
+### Performance Notes
+* The module automatically validates hardware decoders before use to prevent compatibility issues
+* Uses zero-copy frame handling and pre-allocated buffers for optimal performance
+* Hardware acceleration on Jetson may fall back to software decoding depending on video format compatibility
