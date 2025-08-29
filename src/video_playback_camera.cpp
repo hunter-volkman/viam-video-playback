@@ -324,6 +324,8 @@ bool VideoPlaybackCamera::initialize_encoder_pool(int width, int height) {
     mjpeg_encoder_ctxs_.resize(num_encoder_threads_);
     sws_contexts_.resize(num_encoder_threads_);
     yuv_frames_.resize(num_encoder_threads_);
+    encoder_packets_.resize(num_encoder_threads_);
+    jpeg_buffers_.resize(num_encoder_threads_);
     
     for (int i = 0; i < num_encoder_threads_; ++i) {
         // Create encoder context
@@ -378,6 +380,16 @@ bool VideoPlaybackCamera::initialize_encoder_pool(int width, int height) {
                 return false;
             }
         }
+        
+        // Pre-allocate packet for reuse
+        encoder_packets_[i] = av_packet_alloc();
+        if (!encoder_packets_[i]) {
+            std::cerr << "Error: Failed to allocate packet " << i << std::endl;
+            return false;
+        }
+        
+        // Pre-reserve buffer space (1MB typical for JPEG)
+        jpeg_buffers_[i].reserve(1024 * 1024);
     }
     
     return true;
@@ -398,6 +410,13 @@ void VideoPlaybackCamera::cleanup_encoder_pool() {
         if (sws) sws_freeContext(sws);
     }
     sws_contexts_.clear();
+    
+    // Clean up pre-allocated resources
+    for (auto& pkt : encoder_packets_) {
+        if (pkt) av_packet_free(&pkt);
+    }
+    encoder_packets_.clear();
+    jpeg_buffers_.clear();
 }
 
 void VideoPlaybackCamera::start_pipeline() {
@@ -522,8 +541,24 @@ void VideoPlaybackCamera::producer_thread_func() {
             
             frames_decoded_++;
             
-            // Clone frame for queue
-            AVFrame* frame_to_queue = av_frame_clone(frame);
+            // Allocate frame structure only
+            // Not pixel data (no deep copy)
+            // Zero-copy queueing
+            AVFrame* frame_to_queue = av_frame_alloc();
+            if (!frame_to_queue) {
+                frames_dropped_producer_++;
+                av_frame_unref(frame);
+                continue;
+            }
+
+            // Use reference counting instead of cloning
+            if (av_frame_ref(frame_to_queue, frame) < 0) {
+                av_frame_free(&frame_to_queue);
+                frames_dropped_producer_++;
+                av_frame_unref(frame);
+                continue;
+            }
+
             
             // Add to queue
             {
@@ -611,7 +646,7 @@ bool VideoPlaybackCamera::encode_task(
     
     AVFrame* dst_yuv = yuv_frames_[thread_id];
     
-    // Convert color space and/or scale if needed
+    // Convert color space and/or scale (only if needed)
     if (sws_contexts_[thread_id]) {
         sws_scale(sws_contexts_[thread_id],
                  task.frame->data, task.frame->linesize,
@@ -622,20 +657,25 @@ bool VideoPlaybackCamera::encode_task(
         av_frame_copy(dst_yuv, task.frame);
     }
     
-    // Encode to JPEG
-    AVPacket* pkt = av_packet_alloc();
+    // Use pre-allocated packet
+    // Instead of allocating a new packet
+    AVPacket* pkt = encoder_packets_[thread_id];
+    // Clear previous data without freeing
+    av_packet_unref(pkt);
     
     int ret = avcodec_send_frame(mjpeg_encoder_ctxs_[thread_id], dst_yuv);
     if (ret >= 0) {
         ret = avcodec_receive_packet(mjpeg_encoder_ctxs_[thread_id], pkt);
         if (ret >= 0) {
+            // Reuse pre-allocated buffer
+            jpeg_buffer = jpeg_buffers_[thread_id];
             jpeg_buffer.assign(pkt->data, pkt->data + pkt->size);
-            av_packet_free(&pkt);
+            // Don't free the packet (it's reused)
             return true;
         }
     }
     
-    av_packet_free(&pkt);
+    // Don't free the packet on error (it's reused)
     return false;
 }
 

@@ -103,6 +103,8 @@ private:
     std::vector<SwsContext*> sws_contexts_;
     std::vector<AVFrame*> yuv_frames_;
     int num_encoder_threads_ = 4;
+    std::vector<AVPacket*> encoder_packets_;
+    std::vector<std::vector<uint8_t>> jpeg_buffers_;
     
     // Frame queue
     std::queue<EncodingTask> frame_queue_;
