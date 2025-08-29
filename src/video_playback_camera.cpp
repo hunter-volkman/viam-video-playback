@@ -164,48 +164,77 @@ bool VideoPlaybackCamera::initialize_decoder(const std::string& path) {
     
     // Initialize decoder pointer
     decoder_ = nullptr;
+    std::vector<std::string> tried_decoders;
     
     // Try to use hardware decoder if requested
     if (use_hardware_acceleration_) {
 #ifdef USE_NVDEC
+        std::vector<const char*> hw_decoders;
+        
         // On Jetson, try NVIDIA hardware decoders
         if (video_stream->codecpar->codec_id == AV_CODEC_ID_H264) {
-            // Try nvv4l2decoder (newer) first
-            decoder_ = avcodec_find_decoder_by_name("h264_nvv4l2dec");
-            if (decoder_) {
-                std::cout << "Using NVIDIA nvv4l2 H.264 hardware decoder" << std::endl;
-            } else {
-                // Fall back to nvdec
-                decoder_ = avcodec_find_decoder_by_name("h264_nvdec");
-                if (decoder_) {
-                    std::cout << "Using NVIDIA nvdec H.264 hardware decoder" << std::endl;
-                } else {
-                    // Try the generic v4l2 decoder
-                    decoder_ = avcodec_find_decoder_by_name("h264_v4l2m2m");
-                    if (decoder_) {
-                        std::cout << "Using V4L2 H.264 hardware decoder" << std::endl;
-                    }
-                }
-            }
+            hw_decoders = {"h264_nvv4l2dec", "h264_nvdec", "h264_v4l2m2m"};
         } else if (video_stream->codecpar->codec_id == AV_CODEC_ID_HEVC) {
-            decoder_ = avcodec_find_decoder_by_name("hevc_nvv4l2dec");
-            if (decoder_) {
-                std::cout << "Using NVIDIA nvv4l2 HEVC hardware decoder" << std::endl;
-            } else {
-                decoder_ = avcodec_find_decoder_by_name("hevc_nvdec");
-                if (decoder_) {
-                    std::cout << "Using NVIDIA nvdec HEVC hardware decoder" << std::endl;
-                } else {
-                    decoder_ = avcodec_find_decoder_by_name("hevc_v4l2m2m");
-                    if (decoder_) {
-                        std::cout << "Using V4L2 HEVC hardware decoder" << std::endl;
+            hw_decoders = {"hevc_nvv4l2dec", "hevc_nvdec", "hevc_v4l2m2m"};
+        }
+        
+        // Try each hardware decoder with validation
+        for (const char* dec_name : hw_decoders) {
+            tried_decoders.push_back(dec_name);
+            const AVCodec* test_decoder = avcodec_find_decoder_by_name(dec_name);
+            
+            if (!test_decoder) continue;
+            
+            AVCodecContext* test_ctx = avcodec_alloc_context3(test_decoder);
+            if (!test_ctx) continue;
+            
+            if (avcodec_parameters_to_context(test_ctx, video_stream->codecpar) < 0) {
+                avcodec_free_context(&test_ctx);
+                continue;
+            }
+            
+            // Actually try to open and test decode
+            if (avcodec_open2(test_ctx, test_decoder, nullptr) == 0) {
+                // Test decode one frame to verify it works
+                AVPacket* test_pkt = av_packet_alloc();
+                AVFrame* test_frame = av_frame_alloc();
+                bool works = false;
+                
+                if (av_read_frame(format_ctx_, test_pkt) == 0 &&
+                    test_pkt->stream_index == video_stream_index_) {
+                    if (avcodec_send_packet(test_ctx, test_pkt) == 0) {
+                        if (avcodec_receive_frame(test_ctx, test_frame) == 0) {
+                            // Verify pixel format is valid
+                            if (test_frame->format != AV_PIX_FMT_NONE &&
+                                test_frame->width > 0 && test_frame->height > 0) {
+                                works = true;
+                                decoder_ = test_decoder;
+                                std::cout << "Hardware decoder " << dec_name
+                                         << " verified working (format: "
+                                         << av_get_pix_fmt_name((AVPixelFormat)test_frame->format)
+                                         << ")" << std::endl;
+                            }
+                        }
                     }
                 }
+                
+                av_packet_free(&test_pkt);
+                av_frame_free(&test_frame);
+                avcodec_free_context(&test_ctx);
+                
+                // Seek back to beginning
+                av_seek_frame(format_ctx_, video_stream_index_, 0, AVSEEK_FLAG_BACKWARD);
+                
+                if (works) break;
+            } else {
+                avcodec_free_context(&test_ctx);
             }
         }
         
-        if (!decoder_) {
-            std::cout << "NVIDIA hardware decoder not available, falling back to software" << std::endl;
+        if (!decoder_ && !tried_decoders.empty()) {
+            std::cout << "Tried hardware decoders: ";
+            for (const auto& name : tried_decoders) std::cout << name << " ";
+            std::cout << "- none worked, falling back to software" << std::endl;
         }
 #endif
     }
