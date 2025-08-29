@@ -13,6 +13,7 @@
 extern "C" {
 #include <libavutil/opt.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/pixdesc.h>
 }
 #pragma GCC diagnostic pop
 
