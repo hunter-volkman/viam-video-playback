@@ -38,7 +38,10 @@ public:
         std::string mime_type, 
         const viam::sdk::ProtoStruct& extra) override;
     
-    viam::sdk::Camera::image_collection get_images() override;
+    // FIXED: Added required parameters
+    viam::sdk::Camera::image_collection get_images(
+        std::vector<std::string> filter_source_names,
+        const viam::sdk::ProtoStruct& extra) override;
     
     viam::sdk::Camera::point_cloud get_point_cloud(
         std::string mime_type, 

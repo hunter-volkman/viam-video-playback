@@ -773,7 +773,9 @@ vs::ProtoStruct VideoPlaybackCamera::do_command(const vs::ProtoStruct& command) 
     throw vs::Exception("Unknown command: " + cmd_str);
 }
 
-vs::Camera::image_collection VideoPlaybackCamera::get_images() {
+vs::Camera::image_collection VideoPlaybackCamera::get_images(
+    std::vector<std::string> filter_source_names,
+    const vs::ProtoStruct& extra) {
     throw vs::Exception("get_images not implemented");
 }
 
