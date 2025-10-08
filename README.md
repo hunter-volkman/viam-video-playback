@@ -2,7 +2,7 @@
 A Viam `camera` component for local video file playback with hardware acceleration support.
 
 ## Model `hunter:video-playback:camera`
-This model implements the `rdk:component:camera` API to stream video files as a camera component, enabling repetable testing of ML vision services with consistent input. Supports hardware-accelerated H.264/HEVC decoding on NVIDIA Jetson platforms with automatic fallback to software decoding.
+This model implements the `rdk:component:camera` API to stream video files as a camera component, enabling repetable testing of ML vision services with consistent input. Supports hardware-accelerated H.264/HEVC decoding on NVIDIA Jetson platform. Automatic fallback to software decoding.
 
 ### Configuration
 The following attribute template can be used to configure this model:
