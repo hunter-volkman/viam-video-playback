@@ -27,7 +27,7 @@ The following attributes are available for this model:
 | `video_path` | string  | Required  | Absolute path to the video file to stream. |
 | `loop` | boolean | Optional  | Loop video playback when end is reached. Default: `true`. |
 | `target_fps` | integer | Optional  |  Target frame rate. Use 0 for source FPS. Default: `0`. |
-| `jpeg_quality_level` | integer | Optional  | JPEG compression quality (2-31, lower = better quality). Default: `15`. |
+| `jpeg_quality_level` | integer | Optional  | JPEG compression level (range 2-31: lower value = higher quality/larger size). Default: `15`. |
 | `max_resolution` | integer | Optional  | Maximum width/height in pixels. Use 0 for no scaling. Default: `0`. |
 | `use_hardware_acceleration` | boolean | Optional  | Enable hardware decoding on supported platforms. Default: `false`. |
 
