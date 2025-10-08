@@ -1,17 +1,20 @@
 # Video Playback Module
-A Viam `camera` component for local video file playback (with hardware acceleration support).
+A Viam `camera` component for local video file playback with hardware acceleration support.
 
 ## Model `hunter:video-playback:camera`
-This model implements the `rdk:component:camera` API by decoding and streaming video files at consistent FPS for testing ML vision services with repeatable input.
+This model implements the `rdk:component:camera` API to stream video files as a camera component, enabling repetable testing of ML vision services with consistent input. Supports hardware-accelerated H.264/HEVC decoding on NVIDIA Jetson platforms with automatic fallback to software decoding.
 
 ### Configuration
+The following attribute template can be used to configure this model:
 
 ```json
 {
-  "video_path": "/path/to/video.mp4",
-  "loop": true,
-  "target_fps": 25,
-  "use_hardware_acceleration": true
+  "video_path": "<string>",
+  "loop": <boolean>,
+  "target_fps": <integer>,
+  "jpeg_quality_level": <integer>,
+  "max_resolution": <integer>,
+  "use_hardware_acceleration": <boolean>
 }
 ```
 
@@ -21,18 +24,18 @@ The following attributes are available for this model:
 
 | Name          | Type   | Inclusion | Description                |
 |---------------|--------|-----------|----------------------------|
-| `video_path` | string  | Required  | The absolute file path to the video file to be streamed (e.g., "/home/user/videos/test.mp4"). |
-| `loop` | boolean | Optional  | Loop video playback. Defaults to `true`. |
-| `target_fps` | integer | Optional  |  Target frame rate (0 = source FPS). Defaults to 0. |
-| `jpeg_quality_level` | integer | Optional  | JPEG quality 2-31 (lower = better quality). Defaults to 15. |
-| `max_resolution` | integer | Optional  | Max width/height (0 = no scaling). Defaults to 0. |
-| `use_hardware_acceleration` | boolean | Optional  | Enable hardware acceleration (e.g., Jetson NVDEC). Defaults to `false`. |
+| `video_path` | string  | Required  | Absolute path to the video file to stream. |
+| `loop` | boolean | Optional  | Loop video playback when end is reached. Default: `true`. |
+| `target_fps` | integer | Optional  |  Target frame rate. Use 0 for source FPS. Default: `0`. |
+| `jpeg_quality_level` | integer | Optional  | JPEG compression quality (2-31, lower = better quality). Default: `15`. |
+| `max_resolution` | integer | Optional  | Maximum width/height in pixels. Use 0 for no scaling. Default: `0`. |
+| `use_hardware_acceleration` | boolean | Optional  | Enable hardware decoding on supported platforms. Default: `false`. |
 
 #### Example Configuration
 
 ```json
 {
-  "video_path": "/home/jetson/Videos/test.mp4",
+  "video_path": "/home/user/videos/test.mp4",
   "loop": true,
   "target_fps": 25,
   "jpeg_quality_level": 20,
@@ -71,11 +74,9 @@ Check the real-time performance and status of the video playback pipeline.
 }
 ```
 
-### Supported Platforms
-* **macOS** (Apple Silicon): Software decoding with multi-threading
-* **Jetson** (ARM64): Hardware H.264/HEVC decoding with NVIDIA NVDEC (falls back to software if hardware unavailable)
+### Platform Support
+* Linux ARM64 (Jetson): Hardware-accelerated H.264/HEVC decoding via NVDEC
+* macOS ARM64 (Apple Silicon): Multi-threaded software decoding
+* Linux x86_64: Multi-threaded software decoding
 
-### Performance Notes
-* The module automatically validates hardware decoders before use to prevent compatibility issues
-* Uses zero-copy frame handling and pre-allocated buffers for optimal performance
-* Hardware acceleration on Jetson may fall back to software decoding depending on video format compatibility
+See BUILD.md for detailed build instructions.
