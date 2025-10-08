@@ -343,14 +343,14 @@ bool VideoPlaybackCamera::initialize_encoder_pool(int width, int height) {
     
     const AVCodec* mjpeg_encoder = nullptr;
     
-    // Always use software MJPEG encoder for now
-    // (Hardware MJPEG encoding is not commonly available)
+    // Always use software MJPEG encoder
     mjpeg_encoder = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
     if (!mjpeg_encoder) {
         std::cerr << "Error: MJPEG encoder not found" << std::endl;
         return false;
     }
-    
+
+    // Resize vectors for thread pooling
     mjpeg_encoder_ctxs_.resize(num_encoder_threads_);
     sws_contexts_.resize(num_encoder_threads_);
     yuv_frames_.resize(num_encoder_threads_);
@@ -367,10 +367,12 @@ bool VideoPlaybackCamera::initialize_encoder_pool(int width, int height) {
         ctx->height = height;
         ctx->time_base = AVRational{1, static_cast<int>(source_fps_)};
         
-        // Set quality, use lower quality for higher resolutions
+        // Set quality
+        // Use lower quality for higher resolutions
         int adjusted_quality = quality_level_;
         if (width > 2560 || height > 1440) {
-            // For 4K, increase quality value (lower quality) for better performance
+            // 4K: increase quality value (to lower quality)
+            // Improve performance at cost of image quality
             adjusted_quality = std::min(31, quality_level_ + 5);
         }
         
@@ -395,7 +397,8 @@ bool VideoPlaybackCamera::initialize_encoder_pool(int width, int height) {
             return false;
         }
         
-        // Create scaler, handles both color conversion and scaling
+        // Create scaler
+        // Handles both color conversion and scaling
         bool needs_scaling = (width != decoder_ctx_->width || height != decoder_ctx_->height);
         bool needs_conversion = (decoder_ctx_->pix_fmt != AV_PIX_FMT_YUVJ420P);
         
@@ -581,7 +584,7 @@ void VideoPlaybackCamera::producer_thread_func() {
                 continue;
             }
 
-            // Use reference counting instead of cloning
+            // Use reference counting (instead of cloning)
             if (av_frame_ref(frame_to_queue, frame) < 0) {
                 av_frame_free(&frame_to_queue);
                 frames_dropped_producer_++;
@@ -683,7 +686,7 @@ bool VideoPlaybackCamera::encode_task(
                  0, task.frame->height,
                  dst_yuv->data, dst_yuv->linesize);
     } else {
-        // Direct copy
+        // Direct copy (if no conversion/scaling needed)
         av_frame_copy(dst_yuv, task.frame);
     }
     
@@ -732,7 +735,7 @@ vs::Camera::properties VideoPlaybackCamera::get_properties() {
     props.supports_pcd = false;
     props.frame_rate = (target_fps_ > 0) ? target_fps_ : source_fps_;
     
-    // Report output dimensions, not source dimensions
+    // Report output dimensions (not source dimensions)
     props.intrinsic_parameters.width_px = output_width_;
     props.intrinsic_parameters.height_px = output_height_;
     
